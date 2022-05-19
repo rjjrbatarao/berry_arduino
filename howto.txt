@@ -1,0 +1,7 @@
+
+unzip src_inc.zip then
+go to tools map_build then open git bash inside then paste this
+./map_build.exe -o ../../generate -i ../../src ../../default -c ../../inc/berry_conf.h
+
+default folder content is just for the map_build
+copy them to src later
