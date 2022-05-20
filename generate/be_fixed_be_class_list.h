@@ -1,31 +1,38 @@
 #include "be_constobj.h"
 
-static const bmapnode be_class_list_map_slots[] = {
-    { be_const_key(be_const_str_resize, -1), be_const_func(m_resize) },
-    { be_const_key(be_const_str_insert, -1), be_const_func(m_insert) },
-    { be_const_key(be_const_str_init, -1), be_const_func(m_init) },
-    { be_const_key(be_const_str_tostring, -1), be_const_func(m_tostring) },
-    { be_const_key(be_const_str_iter, 5), be_const_func(m_iter) },
-    { be_const_key(be_const_str_size, -1), be_const_func(m_size) },
-    { be_const_key(be_const_str_dot_data, 0), be_const_int(0) },
-    { be_const_key(be_const_str_setitem, -1), be_const_func(m_setitem) },
-    { be_const_key(be_const_str_remove, -1), be_const_func(m_remove) },
-    { be_const_key(be_const_str_append, 2), be_const_func(m_append) },
-    { be_const_key(be_const_str_item, 1), be_const_func(m_item) },
+static be_define_const_map_slots(be_class_list_map) {
+    { be_const_key(opt_add, -1), be_const_func(m_merge) },
+    { be_const_key(init, -1), be_const_func(m_init) },
+    { be_const_key(opt_connect, 11), be_const_func(m_connect) },
+    { be_const_key(tostring, 2), be_const_func(m_tostring) },
+    { be_const_key(pop, 6), be_const_func(m_pop) },
+    { be_const_key(insert, -1), be_const_func(m_insert) },
+    { be_const_key(size, -1), be_const_func(m_size) },
+    { be_const_key(remove, 12), be_const_func(m_remove) },
+    { be_const_key(find, -1), be_const_func(m_find) },
+    { be_const_key(push, 1), be_const_func(m_push) },
+    { be_const_key(item, 5), be_const_func(m_item) },
+    { be_const_key(concat, -1), be_const_func(m_concat) },
+    { be_const_key(dot_p, -1), be_const_var(0) },
+    { be_const_key(iter, -1), be_const_func(m_iter) },
+    { be_const_key(copy, -1), be_const_func(m_copy) },
+    { be_const_key(reverse, 13), be_const_func(m_reverse) },
+    { be_const_key(keys, -1), be_const_func(m_keys) },
+    { be_const_key(resize, 16), be_const_func(m_resize) },
+    { be_const_key(setitem, -1), be_const_func(m_setitem) },
+    { be_const_key(opt_neq, 7), be_const_func(m_nequal) },
+    { be_const_key(clear, -1), be_const_func(m_clear) },
+    { be_const_key(opt_eq, -1), be_const_func(m_equal) },
 };
 
-static const bmap be_class_list_map = {
-    be_const_header_map(),
-    .slots = (bmapnode *)be_class_list_map_slots,
-    .lastfree = (bmapnode *)&be_class_list_map_slots[10],
-    .size = 11,
-    .count = 11
-};
+static be_define_const_map(
+    be_class_list_map,
+    22
+);
 
-const bclass be_class_list = {
-    be_const_header_class(),
-    .nvar = 1,
-    .super = NULL,
-    .members = (bmap *)&be_class_list_map,
-    .name = (bstring *)&be_const_str_list
-};
+BE_EXPORT_VARIABLE be_define_const_class(
+    be_class_list,
+    1,
+    NULL,
+    list
+);

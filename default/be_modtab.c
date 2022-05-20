@@ -1,6 +1,13 @@
-/* this file contains the declaration of the module table. */
-
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "berry.h"
+
+/* this file contains the declaration of the module table. */
 
 /* default modules declare */
 be_extern_native_module(string);
@@ -8,14 +15,21 @@ be_extern_native_module(json);
 be_extern_native_module(math);
 be_extern_native_module(time);
 be_extern_native_module(os);
+be_extern_native_module(global);
+be_extern_native_module(sys);
+be_extern_native_module(debug);
+be_extern_native_module(gc);
+be_extern_native_module(solidify);
+be_extern_native_module(introspect);
+be_extern_native_module(strict);
 
 /* user-defined modules declare start */
 
 /* user-defined modules declare end */
 
 /* module list declaration */
-bntvmodule* const be_module_table[] = {
-    /* default modules register */
+BERRY_LOCAL const bntvmodule* const be_module_table[] = {
+/* default modules register */
 #if BE_USE_STRING_MODULE
     &be_native_module(string),
 #endif
@@ -30,6 +44,27 @@ bntvmodule* const be_module_table[] = {
 #endif
 #if BE_USE_OS_MODULE
     &be_native_module(os),
+#endif
+#if BE_USE_GLOBAL_MODULE
+    &be_native_module(global),
+#endif
+#if BE_USE_SYS_MODULE
+    &be_native_module(sys),
+#endif
+#if BE_USE_DEBUG_MODULE
+    &be_native_module(debug),
+#endif
+#if BE_USE_GC_MODULE
+    &be_native_module(gc),
+#endif
+#if BE_USE_SOLIDIFY_MODULE
+    &be_native_module(solidify),
+#endif
+#if BE_USE_INTROSPECT_MODULE
+    &be_native_module(introspect),
+#endif
+#if BE_USE_STRICT_MODULE
+    &be_native_module(strict),
 #endif
     /* user-defined modules register start */
 
