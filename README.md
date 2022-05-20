@@ -1,10 +1,16 @@
 # berry_arduino
 berrylang for arduino
-Current berry version 1.0.0
+Current berry version 1.0.0 latest at the time writing
 
 # Gotchas
-be_modtab.c and be_port.c should be place on the src or on the sketch root alongside .ino to be auto discovered
-
+```
+Note: be_modtab.c and be_port.c should be place on the src or on the sketch root alongside .ino to be auto discovered
+Copy this to arduino libraries:
+https://github.com/rjjrbatarao/berry_mapping
+To generate mapping:
+chmod u+x generate.sh
+./generate.sh
+```
 
 # Adding custom modules
 create folder for modules with src ext berry_nxtfi/src
