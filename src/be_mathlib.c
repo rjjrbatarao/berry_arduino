@@ -1,19 +1,49 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_object.h"
 #include <math.h>
+#include <limits.h>
 #include <stdlib.h>
 
 #if BE_USE_MATH_MODULE
 
 #ifdef M_PI
-#undef M_PI
+  #undef M_PI
 #endif
 #define M_PI        3.141592653589793238462643383279
 
-#if BE_SINGLE_FLOAT
-#define mathfunc(func)          func##f
-#else
-#define mathfunc(func)          func
+#if BE_INTGER_TYPE == 0 /* int */
+  #define M_IMAX    INT_MAX
+  #define M_IMIN    INT_MIN
+#elif BE_INTGER_TYPE == 1 /* long */
+  #define M_IMAX    LONG_MAX
+  #define M_IMIN    LONG_MIN
+#else /* int64_t (long long) */
+  #define M_IMAX    LLONG_MAX
+  #define M_IMIN    LLONG_MIN
 #endif
+
+#if BE_USE_SINGLE_FLOAT
+  #define mathfunc(func)        func##f
+#else
+  #define mathfunc(func)        func
+#endif
+
+static int m_isnan(bvm *vm)
+{
+    if (be_top(vm) >= 1 && be_isreal(vm, 1)) {
+        breal x = be_toreal(vm, 1);
+        be_pushbool(vm, isnan(x));
+    } else {
+        be_pushbool(vm, bfalse);
+    }
+    be_return(vm);
+}
 
 static int m_abs(bvm *vm)
 {
@@ -108,6 +138,18 @@ static int m_atan(bvm *vm)
     if (be_top(vm) >= 1 && be_isnumber(vm, 1)) {
         breal x = be_toreal(vm, 1);
         be_pushreal(vm, mathfunc(atan)(x));
+    } else {
+        be_pushreal(vm, (breal)0.0);
+    }
+    be_return(vm);
+}
+
+static int m_atan2(bvm *vm)
+{
+    if (be_top(vm) >= 2 && be_isnumber(vm, 1) && be_isnumber(vm, 2)) {
+        breal y = be_toreal(vm, 1);
+        breal x = be_toreal(vm, 2);
+        be_pushreal(vm, mathfunc(atan2)(y, x));
     } else {
         be_pushreal(vm, (breal)0.0);
     }
@@ -240,7 +282,8 @@ static int m_rand(bvm *vm)
 }
 
 #if !BE_USE_PRECOMPILED_OBJECT
-be_native_module_attr_table(attr_table) {
+be_native_module_attr_table(math) {
+    be_native_module_function("isnan", m_isnan),
     be_native_module_function("abs", m_abs),
     be_native_module_function("ceil", m_ceil),
     be_native_module_function("floor", m_floor),
@@ -250,6 +293,7 @@ be_native_module_attr_table(attr_table) {
     be_native_module_function("asin", m_asin),
     be_native_module_function("acos", m_acos),
     be_native_module_function("atan", m_atan),
+    be_native_module_function("atan2", m_atan2),
     be_native_module_function("sinh", m_sinh),
     be_native_module_function("cosh", m_cosh),
     be_native_module_function("tanh", m_tanh),
@@ -262,13 +306,17 @@ be_native_module_attr_table(attr_table) {
     be_native_module_function("pow", m_pow),
     be_native_module_function("srand", m_srand),
     be_native_module_function("rand", m_rand),
-    be_native_module_real("pi", M_PI)
+    be_native_module_real("pi", M_PI),
+    be_native_module_real("nan", NAN),
+    be_native_module_int("imax", M_IMAX),
+    be_native_module_int("imin", M_IMIN),
 };
 
-be_define_native_module(math, attr_table);
+be_define_native_module(math, NULL);
 #else
 /* @const_object_info_begin
 module math (scope: global, depend: BE_USE_MATH_MODULE) {
+    isnan, func(m_isnan)
     abs, func(m_abs)
     ceil, func(m_ceil)
     floor, func(m_floor)
@@ -278,6 +326,7 @@ module math (scope: global, depend: BE_USE_MATH_MODULE) {
     asin, func(m_asin)
     acos, func(m_acos)
     atan, func(m_atan)
+    atan2, func(m_atan2)
     sinh, func(m_sinh)
     cosh, func(m_cosh)
     tanh, func(m_tanh)
@@ -291,6 +340,9 @@ module math (scope: global, depend: BE_USE_MATH_MODULE) {
     srand, func(m_srand)
     rand, func(m_rand)
     pi, real(M_PI)
+    nan, real(NAN)
+    imax, int(M_IMAX)
+    imin, int(M_IMIN)
 }
 @const_object_info_end */
 #include "../generate/be_fixed_math.h"

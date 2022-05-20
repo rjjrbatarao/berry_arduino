@@ -5,24 +5,13 @@
 ** See Copyright Notice in the LICENSE file or at
 ** https://github.com/Skiars/berry/blob/master/LICENSE
 ********************************************************************/
-#ifndef BE_DEBUG_H
-#define BE_DEBUG_H
+#ifndef __BE_BYTECODE_H
+#define __BE_BYTECODE_H
 
 #include "be_object.h"
 
-struct bhookblock {
-    void *data;
-    bntvhook hook;
-};
-
-void be_dumpclosure(bclosure *cl);
-void be_tracestack(bvm *vm);
-void be_callhook(bvm *vm, int mask);
-bbool be_debug_varname(bvm *vm, int level, int index);
-bbool be_debug_upvname(bvm *vm, int level, int index);
-
-#if BE_USE_DEBUG_MODULE
-void be_print_inst(binstruction ins, int pc);
-#endif
+void be_bytecode_save(bvm *vm, const char *filename, bproto *proto);
+bclosure* be_bytecode_load(bvm *vm, const char *filename);
+bbool be_bytecode_check(const char *path);
 
 #endif

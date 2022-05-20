@@ -1,3 +1,10 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_lexer.h"
 #include "be_string.h"
 #include "be_mem.h"
@@ -9,6 +16,7 @@
 #define SHORT_STR_LEN       32
 #define EOS                 '\0' /* end of source */
 
+#define type_count()        (int)array_count(kwords_tab)
 #define lexbuf(lex)         ((lex)->buf.s)
 #define isvalid(lex)        ((lex)->cursor < (lex)->endbuf)
 #define lgetc(lex)          ((lex)->cursor)
@@ -17,34 +25,35 @@
 #define setreal(lex, v)     ((lex)->token.u.r = (v))
 #define match(lex, pattern) while (pattern(lgetc(lex))) { save(lex); }
 
+#if BE_USE_SCRIPT_COMPILER
+
 /* IMPORTANT: This must follow the enum found in be_lexer.h !!! */
 static const char* const kwords_tab[] = {
-        "NONE", "EOS", "ID", "INT", "REAL", "STR",
-        "=", "+=","-=", "*=", "/=", "%=", "&=", "|=",
-        "^=", "<<=", ">>=", "+", "-", "*", "/", "%",
-        "<", "<=", "==", "!=", ">", ">=", "&", "|",
-        "^", "<<", ">>", "..", "&&", "||", "!", "~",
-        "(", ")", "[", "]", "{", "}", ".", ",", ";",
-        ":", "if", "elif", "else", "while", "for",
-        "def", "end", "class", "break", "continue",
-        "return", "true", "false", "nil", "var", "do",
-        "import", "as"
+    "NONE", "EOS", "ID", "INT", "REAL", "STR",
+    "=", "+=","-=", "*=", "/=", "%=", "&=", "|=",
+    "^=", "<<=", ">>=", "+", "-", "*", "/", "%",
+    "<", "<=", "==", "!=", ">", ">=", "&", "|",
+    "^", "<<", ">>", "..", "&&", "||", "!", "~",
+    "(", ")", "[", "]", "{", "}", ".", ",", ";",
+    ":", "?", "->", "if", "elif", "else", "while",
+    "for", "def", "end", "class", "break", "continue",
+    "return", "true", "false", "nil", "var", "do",
+    "import", "as", "try", "except", "raise", "static"
 };
 
 void be_lexerror(blexer *lexer, const char *msg)
 {
     bvm *vm = lexer->vm;
-    be_pushfstring(vm, "%s:%d: error: %s",
-                   lexer->fname, lexer->linenumber, msg);
+    const char *error = be_pushfstring(vm,
+        "%s:%d: %s", lexer->fname, lexer->linenumber, msg);
     be_lexer_deinit(lexer);
-    be_incrtop(lexer->vm); /* push the error message */
-    be_throw(vm, BE_SYNTAX_ERROR);
+    be_raise(vm, "syntax_error", error);
 }
 
 static void keyword_registe(bvm *vm)
 {
-    int i, n = (int)array_count(kwords_tab);
-    for (i = KeyIf; i < n; ++i) {
+    int i;
+    for (i = KeyIf; i < type_count(); ++i) {
         bstring *s = be_newstr(vm, kwords_tab[i]);
         be_gc_fix(vm, gc_object(s));
         be_str_setextra(s, i);
@@ -53,8 +62,8 @@ static void keyword_registe(bvm *vm)
 
 static void keyword_unregiste(bvm *vm)
 {
-    int i, n = (int)array_count(kwords_tab);
-    for (i = KeyIf; i < n; ++i) {
+    int i;
+    for (i = KeyIf; i < type_count(); ++i) {
         bstring *s = be_newstr(vm, kwords_tab[i]);
         be_gc_unfix(vm, gc_object(s));
     }
@@ -66,7 +75,7 @@ static bstring* cache_string(blexer *lexer, bstring *s)
     bvm *vm = lexer->vm;
     var_setstr(vm->top, s);
     be_stackpush(vm); /* cache string to stack */
-    res = be_map_findstr(lexer->strtab, s);
+    res = be_map_findstr(lexer->vm, lexer->strtab, s);
     if (res) {
         s = var_tostr(&be_map_val2node(res)->key);
     } else {
@@ -127,7 +136,7 @@ static bstring* buf_tostr(blexer *lexer)
 
 static int is_newline(int c)
 {
-    return c == '\r' || c == '\n';
+    return c == '\n' || c == '\r';
 }
 
 static int is_digit(int c)
@@ -135,14 +144,19 @@ static int is_digit(int c)
     return c >= '0' && c <= '9';
 }
 
+static int is_octal(int c)
+{
+    return c >= '0' && c <= '7';
+}
+
 static int is_letter(int c)
 {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c == '_');
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c == '_');
 }
 
 static int is_word(int c)
 {
-    return is_digit(c) || is_letter(c);
+    return is_letter(c) || is_digit(c);
 }
 
 static int check_next(blexer *lexer, int c)
@@ -170,7 +184,7 @@ static int check2hex(blexer *lexer, int c)
 {
     c = char2hex(c);
     if (c < 0) {
-        be_lexerror(lexer, "hexadecimal digit expected.");
+        be_lexerror(lexer, "invalid hexadecimal number");
     }
     return c;
 }
@@ -178,19 +192,18 @@ static int check2hex(blexer *lexer, int c)
 static int read_hex(blexer *lexer, const char *src)
 {
     int c = check2hex(lexer, *src++);
-
-    return (c << 4) + check2hex(lexer, *src);
+    return ((unsigned)c << 4) + check2hex(lexer, *src);
 }
 
 static int read_oct(blexer *lexer, const char *src)
 {
-    int i, c = 0;
-
-    for (i = 0; i < 3 && is_digit(*src); ++i) {
+    int c = 0;
+    const char *end = src + 3;
+    while (src < end && is_octal(*src)) {
         c = 8 * c + *src++ - '0';
     }
-    if (i < 3 && !(c == EOS && i == 1)) {
-        be_lexerror(lexer, "octal escape too few.");
+    if (src < end) {
+        be_lexerror(lexer, "invalid octal number");
     }
     return c;
 }
@@ -204,7 +217,7 @@ static void tr_string(blexer *lexer)
         int c = *src++;
         switch (c) {
         case '\n': case '\r':
-            be_lexerror(lexer, "unfinished string.");
+            be_lexerror(lexer, "unfinished string");
             break;
         case '\\':
             switch (*src) {
@@ -269,7 +282,7 @@ static void skip_comment(blexer *lexer)
     }
 }
 
-static int scan_realexp(blexer *lexer)
+static bbool scan_realexp(blexer *lexer)
 {
     int c = lgetc(lexer);
     if (c == 'e' || c == 'E') {
@@ -278,19 +291,19 @@ static int scan_realexp(blexer *lexer)
             c = save(lexer);
         }
         if (!is_digit(c)) {
-            be_lexerror(lexer, "number error.");
+            be_lexerror(lexer, "malformed number");
         }
         match(lexer, is_digit);
-        return 1;
+        return btrue;
     }
-    return 0;
+    return bfalse;
 }
 
 static btokentype scan_dot_real(blexer *lexer)
 {
     if (save(lexer) == '.') { /* is '..' */
         next(lexer);
-        return OptRange;
+        return OptConnect;
     }
     if (is_digit(lgetc(lexer))) {
         match(lexer, is_digit);
@@ -301,15 +314,50 @@ static btokentype scan_dot_real(blexer *lexer)
     return OptDot;
 }
 
-static bint scan_hex(blexer *lexer)
+/* check the dots is a decimal dot or '..' operator */
+static bbool decimal_dots(blexer *lexer)
+{
+    if (lgetc(lexer) == '.') { /* '..' or real */
+        if (save(lexer) != '.') { /* read numberic => \.\b* */
+            match(lexer, is_digit); /* match and skip numberic */
+            return btrue;
+        }
+        /* token '..' */
+        next(lexer); /*  skip the second '.' */
+        lexer->cacheType = OptConnect;
+    }
+    return bfalse; /* operator '..' */
+}
+
+static bint scan_hexadecimal(blexer *lexer)
 {
     bint res = 0;
-    int dig;
+    int dig, num = 0;
     while ((dig = char2hex(lgetc(lexer))) >= 0) {
-        res = (res << 4) + dig;
+        res = ((bint)res << 4) + dig;
         next(lexer);
+        ++num;
+    }
+    if (num == 0) {
+        be_lexerror(lexer, "invalid hexadecimal number");
     }
     return res;
+}
+
+static btokentype scan_decimal(blexer *lexer)
+{
+    btokentype type = TokenInteger;
+    match(lexer, is_digit);
+    if (decimal_dots(lexer) | scan_realexp(lexer)) {
+        type = TokenReal;
+    }
+    lexer->buf.s[lexer->buf.len] = '\0';
+    if (type == TokenReal) {
+        setreal(lexer, be_str2real(lexbuf(lexer), NULL));
+    } else {
+        setint(lexer, be_str2int(lexbuf(lexer), NULL));
+    }
+    return type;
 }
 
 static btokentype scan_numeral(blexer *lexer)
@@ -319,26 +367,14 @@ static btokentype scan_numeral(blexer *lexer)
     /* hex: 0[xX][0-9a-fA-F]+ */
     if (c0 == '0' && (c1 == 'x' || c1 == 'X')) {
         next(lexer);
-        setint(lexer, scan_hex(lexer));
+        setint(lexer, scan_hexadecimal(lexer));
     } else {
-        match(lexer, is_digit);
-        if (lgetc(lexer) == '.') { /* '..' or real */
-            if (save(lexer) == '.') { /* token  '..' */
-                next(lexer); /*  skip the second '.' */
-                lexer->cacheType = OptRange;
-            } else {
-                match(lexer, is_digit); /* read numberic */
-                type = TokenReal;
-            }
-        }
-        if (!lexer->cacheType && scan_realexp(lexer)) {
-            type = TokenReal;
-        }
-        lexer->buf.s[lexer->buf.len] = '\0';
-        if (type == TokenReal) {
-            setreal(lexer, be_str2real(lexbuf(lexer), NULL));
-        } else {
-            setint(lexer, be_str2int(lexbuf(lexer), NULL));
+        type = scan_decimal(lexer);
+    }
+    /* can't follow decimal or letter after numeral */
+    if (lexer->cacheType == TokenNone) {
+        if (is_letter(lgetc(lexer)) || decimal_dots(lexer)) {
+            be_lexerror(lexer, "malformed number");
         }
     }
     return type;
@@ -346,12 +382,14 @@ static btokentype scan_numeral(blexer *lexer)
 
 static btokentype scan_identifier(blexer *lexer)
 {
+    int type;
     bstring *s;
     save(lexer);
     match(lexer, is_word);
     s = buf_tostr(lexer);
-    if (str_extra(s) != 0) {
-        lexer->token.type = (btokentype)str_extra(s);
+    type = str_extra(s);
+    if (type >= KeyIf && type < type_count()) {
+        lexer->token.type = (btokentype)type;
         return lexer->token.type;
     }
     setstr(lexer, s); /* set identifier name */
@@ -378,6 +416,18 @@ static btokentype scan_assign(blexer *lexer, btokentype is, btokentype not)
 {
     next(lexer);
     return check_next(lexer, '=') ? is : not;
+}
+
+static btokentype scan_sub(blexer *lexer)
+{
+    btokentype op;
+    switch (next(lexer)) {
+        case '>': op = OptArrow; break;
+        case '=': op = OptSubAssign; break;
+        default: return OptSub;
+    }
+    next(lexer);
+    return op;
 }
 
 static btokentype scan_and(blexer *lexer)
@@ -448,7 +498,7 @@ static btokentype lexer_next(blexer *lexer)
         case EOS: return TokenEOS; /* end of source stream */
         /* operator */
         case '+': return scan_assign(lexer, OptAddAssign, OptAdd);
-        case '-': return scan_assign(lexer, OptSubAssign, OptSub);
+        case '-': return scan_sub(lexer);
         case '*': return scan_assign(lexer, OptMulAssign, OptMul);
         case '/': return scan_assign(lexer, OptDivAssign, OptDiv);
         case '%': return scan_assign(lexer, OptModAssign, OptMod);
@@ -461,6 +511,7 @@ static btokentype lexer_next(blexer *lexer)
         case ',': next(lexer); return OptComma;
         case ';': next(lexer); return OptSemic;
         case ':': next(lexer); return OptColon;
+        case '?': next(lexer); return OptQuestion;
         case '^': return scan_assign(lexer, OptXorAssign, OptBitXor);
         case '~': next(lexer); return OptFlip;
         case '&': return scan_and(lexer);
@@ -482,7 +533,7 @@ static btokentype lexer_next(blexer *lexer)
             return scan_numeral(lexer);
         default:
             if (is_letter(lgetc(lexer))) {
-                return scan_identifier(lexer);;
+                return scan_identifier(lexer);
             }
             be_lexerror(lexer, be_pushfstring(lexer->vm,
                 "stray '\\%d' in program", (unsigned char)lgetc(lexer)));
@@ -521,13 +572,11 @@ void be_lexer_deinit(blexer *lexer)
 {
     be_free(lexer->vm, lexer->buf.s, lexer->buf.size);
     keyword_unregiste(lexer->vm);
-    be_stackpop(lexer->vm, 1); /* pop strtab */
 }
 
 int be_lexer_scan_next(blexer *lexer)
 {
     btokentype type;
-
     if (lexer->cacheType != TokenNone) {
         lexer->token.type = lexer->cacheType;
         lexer->cacheType = TokenNone;
@@ -568,3 +617,5 @@ const char* be_tokentype2str(btokentype type)
 {
     return kwords_tab[type];
 }
+
+#endif

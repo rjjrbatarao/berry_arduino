@@ -1,3 +1,10 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_vector.h"
 #include "be_mem.h"
 #include <string.h>
@@ -9,6 +16,7 @@ void be_vector_init(bvm *vm, bvector *vector, int size)
 {
     vector->capacity = 2; /* the default capacity */
     vector->size = size;
+    vector->count = 0;
     vector->data = be_malloc(vm, (size_t)vector->capacity * size);
     vector->end = (char*)vector->data - size;
     memset(vector->data, 0, (size_t)vector->capacity * size);
@@ -19,29 +27,16 @@ void be_vector_delete(bvm *vm, bvector *vector)
     be_free(vm, vector->data, (size_t)vector->capacity * vector->size);
 }
 
-int be_vector_count(bvector *vector)
-{
-    size_t size = vector->size;
-    return vector->data ?
-        cast_int(((size_t)vector->end + size - (size_t)vector->data) / size)
-        : 0;
-}
-
-bbool be_vector_isempty(bvector *vector)
-{
-    return cast_bool(vector->data && vector->data > vector->end);
-}
-
 void* be_vector_at(bvector *vector, int index)
 {
     return (char*)vector->data + (size_t)index * vector->size;
 }
 
-void be_vector_append(bvm *vm, bvector *vector, void *data)
+void be_vector_push(bvm *vm, bvector *vector, void *data)
 {
     size_t size = vector->size;
     size_t capacity = vector->capacity;
-    size_t count = be_vector_count(vector);
+    size_t count = vector->count++;
     if (count >= capacity) {
         int newcap = be_nextsize(vector->capacity);
         vector->data = be_realloc(vm,
@@ -57,37 +52,42 @@ void be_vector_append(bvm *vm, bvector *vector, void *data)
 }
 
 /* clear the expanded portion if the memory expands */
-void be_vector_append_c(bvm *vm, bvector *vector, void *data)
+void be_vector_push_c(bvm *vm, bvector *vector, void *data)
 {
     int capacity = vector->capacity + 1;
-    be_vector_append(vm, vector, data);
+    be_vector_push(vm, vector, data);
     if (vector->capacity > capacity) {
-        size_t size = (vector->capacity - capacity) * vector->size;
+        size_t size = ((size_t)vector->capacity - capacity) * vector->size;
         memset(be_vector_at(vector, capacity), 0, size);
     }
 }
 
 void be_vector_remove_end(bvector *vector)
 {
+    be_assert(vector->count > 0);
+    vector->count--;
     vector->end = (char*)vector->end - vector->size;
 }
 
 void be_vector_resize(bvm *vm, bvector *vector, int count)
 {
     size_t size = vector->size;
-    int newcap = be_nextsize(count);
+    be_assert(count >= 0);
     if (count != be_vector_count(vector)) {
-        if (newcap > vector->capacity) {
+        int newcap = be_nextsize(count);
+        if (newcap > vector->capacity) { /* extended capacity */
             vector->data = be_realloc(vm,
                 vector->data, vector->capacity * size, newcap * size);
             vector->capacity = newcap;
         }
-        vector->end = (char*)vector->data + size * (count - 1);
+        vector->count = count;
+        vector->end = (char*)vector->data + size * ((size_t)count - 1);
     }
 }
 
 void be_vector_clear(bvector *vector)
 {
+    vector->count = 0;
     vector->end = (char*)vector->data - vector->size;
 }
 
@@ -104,7 +104,7 @@ void* be_vector_release(bvm *vm, bvector *vector)
     } else if (count < vector->capacity) {
         vector->data = be_realloc(vm,
             vector->data, vector->capacity * size, count * size);
-        vector->end = (char*)vector->data + (count - 1) * size;
+        vector->end = (char*)vector->data + ((size_t)count - 1) * size;
         vector->capacity = count;
     }
     return vector->data;

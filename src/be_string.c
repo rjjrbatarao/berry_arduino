@@ -1,3 +1,10 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_string.h"
 #include "be_vm.h"
 #include "be_mem.h"
@@ -7,18 +14,18 @@
 #define next(_s)    cast(void*, cast(bstring*, (_s)->next))
 #define sstr(_s)    cast(char*, cast(bsstring*, _s) + 1)
 #define lstr(_s)    cast(char*, cast(blstring*, _s) + 1)
-#define cstr(_s)    (cast(bcstring*, s)->s)
+#define cstr(_s)    (cast(bcstring*, _s)->s)
 
 #define be_define_const_str(_name, _s, _hash, _extra, _len, _next) \
-const bcstring be_const_str_##_name = { \
-    .next = (bgcobject *)_next, \
-    .type = BE_STRING, \
-    .marked = GC_CONST, \
-    .extra = _extra, \
-    .slen = _len, \
-    .hash = _hash, \
-    .s = _s \
-}
+    BERRY_LOCAL const bcstring be_const_str_##_name = {            \
+        .next = (bgcobject *)_next,                                \
+        .type = BE_STRING,                                         \
+        .marked = GC_CONST,                                        \
+        .extra = _extra,                                           \
+        .slen = _len,                                              \
+        .hash = _hash,                                             \
+        .s = _s                                                    \
+    }
 
 /* const string table */
 struct bconststrtab {
@@ -38,12 +45,30 @@ int be_eqstr(bstring *s1, bstring *s2)
         return 1;
     }
     slen = s1->slen;
+    /* discard different lengths */
+    if (slen != s2->slen) {
+        return 0;
+    }
     /* long string */
-    if (slen == 255 && slen == s2->slen) {
+    if (slen == 255) {  /* s2->slen is also 255 */
         blstring *ls1 = cast(blstring*, s1);
         blstring *ls2 = cast(blstring*, s2);
         return ls1->llen == ls2->llen && !strcmp(lstr(ls1), lstr(ls2));
     }
+    /* const short strings */
+    if (gc_isconst(s1) || gc_isconst(s2)) { /* one of the two string is short const */
+        uint32_t hash1 = cast(bcstring*, s1)->hash;
+        uint32_t hash2 = cast(bcstring*, s2)->hash;
+        if (hash1 && hash2 && hash1 != hash2) {
+            return 0; /* if hash differ, since we know both are non-null */
+        }
+        /* if hash are equals, there might be a chance that they are different */
+        /* This can happen with solidified code that a same string is present more than once */
+        /* so just considering that two strings with the same hash must be same pointer, this is no more true */
+        return !strcmp(str(s1), str(s2));
+    }
+
+    /* if both strings are in-memory, they can't be equal without having the same pointer */
     return 0;
 }
 
@@ -85,26 +110,23 @@ static void free_sstring(bvm *vm, bstring *str)
 }
 
 /* FNV-1a Hash */
-uint32_t str_hash(const char *str, size_t len)
+static uint32_t str_hash(const char *str, size_t len)
 {
     uint32_t hash = 2166136261u;
     be_assert(str || len);
     while (len--) {
-        hash = (hash ^ *str++) * 16777619u;
+        hash = (hash ^ (unsigned char)*str++) * 16777619u;
     }
     return hash;
 }
 
 void be_string_init(bvm *vm)
 {
-    vm->strtab.size = 0;
-    vm->strtab.count = 0;
-    vm->strtab.table = NULL;
     resize(vm, 8);
 #if !BE_USE_PRECOMPILED_OBJECT
     /* the destructor name deinit needs to exist all the time, to ensure
      * that it does not need to be created when the heap is exhausted. */
-    be_gc_fix(vm, cast(bgcobject*, be_newstr(vm, "deinit")));
+    be_gc_fix(vm, cast(bgcobject*, str_literal(vm, "deinit")));
 #endif
     /* be_const_str_deinit --> for precompiled */
 }
@@ -124,7 +146,7 @@ void be_string_deleteall(bvm *vm)
     be_free(vm, tab->table, tab->size * sizeof(bstring*));
 }
 
-bstring* createstrobj(bvm *vm, size_t len, int islong)
+static bstring* createstrobj(bvm *vm, size_t len, int islong)
 {
     size_t size = (islong ? sizeof(blstring)
                 : sizeof(bsstring)) + len + 1;
@@ -166,21 +188,23 @@ static bstring* newshortstr(bvm *vm, const char *str, size_t len)
         }
     }
     s = createstrobj(vm, len, 0);
-    memcpy(cast(char *, sstr(s)), str, len);
-    s->extra = 0;
-    s->next = cast(void*, *list);
-#if BE_STR_HASH_CACHE
-    cast(bsstring*, s)->hash = hash;
+    if (s) {
+        memcpy(cast(char *, sstr(s)), str, len);
+        s->extra = 0;
+        s->next = cast(void*, *list);
+#if BE_USE_STR_HASH_CACHE
+        cast(bsstring*, s)->hash = hash;
 #endif
-    *list = s;
-    vm->strtab.count++;
-    if (vm->strtab.count > size << 2) {
-        resize(vm, size << 1);
+        *list = s;
+        vm->strtab.count++;
+        if (vm->strtab.count > size << 2) {
+            resize(vm, size << 1);
+        }
     }
     return s;
 }
 
-static bstring* newlongstr(bvm *vm, const char *str, size_t len)
+bstring* be_newlongstr(bvm *vm, const char *str, size_t len)
 {
     bstring *s;
     blstring *ls;
@@ -209,7 +233,7 @@ bstring *be_newstrn(bvm *vm, const char *str, size_t len)
         return newshortstr(vm, str, len);
 #endif
     }
-    return newlongstr(vm, str, len); /* long string */
+    return be_newlongstr(vm, str, len); /* long string */
 }
 
 void be_gcstrtab(bvm *vm)
@@ -240,12 +264,17 @@ void be_gcstrtab(bvm *vm)
     }
 }
 
-uint32_t be_strhash(bstring *s)
+uint32_t be_strhash(const bstring *s)
 {
     if (gc_isconst(s)) {
-        return cast(bcstring*, s)->hash;
+        bcstring* cs = cast(bcstring*, s);
+        if (cs->hash) {  /* if hash is null we need to compute it */
+            return cs->hash;
+        } else {
+            return str_hash(cstr(s), str_len(s));
+        }
     }
-#if BE_STR_HASH_CACHE
+#if BE_USE_STR_HASH_CACHE
     if (s->slen != 255) {
         return cast(bsstring*, s)->hash;
     }
@@ -253,8 +282,9 @@ uint32_t be_strhash(bstring *s)
     return str_hash(str(s), str_len(s));
 }
 
-const char* be_str2cstr(bstring *s)
+const char* be_str2cstr(const bstring *s)
 {
+    be_assert(cast_str(s) != NULL);
     if (gc_isconst(s)) {
         return cstr(s);
     }

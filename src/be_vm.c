@@ -1,10 +1,18 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_vm.h"
-#include "be_opcode.h"
+#include "be_decoder.h"
 #include "be_string.h"
 #include "be_strlib.h"
 #include "be_class.h"
 #include "be_func.h"
 #include "be_vector.h"
+#include "be_list.h"
 #include "be_map.h"
 #include "be_module.h"
 #include "be_mem.h"
@@ -14,79 +22,117 @@
 #include "be_debug.h"
 #include "be_libs.h"
 #include <string.h>
+#include <math.h>
 
-#define NOT_METHOD      BE_NONE
+#define NOT_METHOD          BE_NONE
 
-#define vm_error(vm, ...) \
-    be_pusherror(vm, be_pushfstring(vm, __VA_ARGS__))
+#define vm_error(vm, except, ...) \
+    be_raise(vm, except, be_pushfstring(vm, __VA_ARGS__))
 
-#define RA(i)   (vm->reg + IGET_RA(i))
-#define RKB(i)  ((isKB(i) ? curcl(vm)->proto->ktab \
-                          : vm->reg) + KR2idx(IGET_RKB(i)))
-#define RKC(i)  ((isKC(i) ? curcl(vm)->proto->ktab \
-                          : vm->reg) + KR2idx(IGET_RKC(i)))
+#define RA()   (reg + IGET_RA(ins))  /* Get value of register A */
+#define RKB()  ((isKB(ins) ? ktab : reg) + KR2idx(IGET_RKB(ins)))  /* Get value of register or constant B */
+#define RKC()  ((isKC(ins) ? ktab : reg) + KR2idx(IGET_RKC(ins)))  /* Get value of register or constant C */
 
-#define var2real(_v) \
-    (var_isreal(_v) ? (_v)->v.r : (breal)(_v)->v.i)
+#define var2cl(_v)          cast(bclosure*, var_toobj(_v))  /* cast var to closure */
+#define var2real(_v)        (var_isreal(_v) ? (_v)->v.r : (breal)(_v)->v.i)  /* get var as real or convert to real if integer */
+#define val2bool(v)         ((v) ? btrue : bfalse)  /* get var as bool (trur if non zero) */
+#define ibinop(op, a, b)    ((a)->v.i op (b)->v.i)  /* apply binary operator to both arguments as integers */
 
-#define val2bool(v)        ((v) ? btrue : bfalse)
-#define ibinop(op, a, b)    ((a)->v.i op (b)->v.i)
-
-#define define_function(name, block) \
-    static void name(bvm *vm, binstruction ins) { \
-        block \
+#if BE_USE_DEBUG_HOOK
+  #define DEBUG_HOOK() \
+    if (vm->hookmask & BE_HOOK_LINE) { \
+        do_linehook(vm); \
+        reg = vm->reg; \
     }
+#else
+  #define DEBUG_HOOK()
+#endif
 
-#define relop_block(op) \
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins); \
-    if (var_isint(a) && var_isint(b)) { \
-        var_setbool(dst, ibinop(op, a, b)); \
-    } else if (var_isnumber(a) && var_isnumber(b)) { \
-        breal x = var2real(a), y = var2real(b); \
-        var_setbool(dst, x op y); \
-    } else if (var_isstr(a) && var_isstr(b)) { \
-        bstring *s1 = var_tostr(a), *s2 = var_tostr(b); \
-        int res = be_strcmp(s1, s2); \
-        var_setbool(dst, res op 0); \
-    } else if (var_isinstance(a)) { \
-        binstance *obj = var_toobj(a); \
-        object_binop(vm, #op, ins, a, b); \
-        check_bool(vm, obj, #op); \
-    } else { \
-        binop_error(vm, #op, a, b); \
+#if BE_USE_PERF_COUNTERS
+  #define COUNTER_HOOK() \
+    vm->counter_ins++;
+#else
+  #define COUNTER_HOOK()
+#endif
+
+#if BE_USE_PERF_COUNTERS
+  #define VM_HEARTBEAT() \
+    if ((vm->counter_ins & ((1<<(BE_VM_OBSERVABILITY_SAMPLING - 1))-1) ) == 0) { /* call every 2^BE_VM_OBSERVABILITY_SAMPLING instructions */    \
+        if (vm->obshook != NULL)                                                    \
+            (*vm->obshook)(vm, BE_OBS_VM_HEARTBEAT, vm->counter_ins);               \
     }
+#else
+  #define VM_HEARTBEAT()
+#endif
 
-#define equal_block(op) \
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins); \
+#define vm_exec_loop() \
+    loop: \
+        DEBUG_HOOK(); \
+        COUNTER_HOOK(); \
+        VM_HEARTBEAT(); \
+        switch (IGET_OP(ins = *vm->ip++))
+
+#if BE_USE_SINGLE_FLOAT
+  #define mathfunc(func)    func##f
+#else
+  #define mathfunc(func)    func
+#endif
+
+#define opcase(opcode)      case OP_##opcode
+#define dispatch()          goto loop
+
+#define equal_rule(op, iseq) \
+    bbool res; \
     if (var_isint(a) && var_isint(b)) { \
-        var_setbool(dst, ibinop(op, a, b)); \
+        res = ibinop(op, a, b); \
     } else if (var_isnumber(a) && var_isnumber(b)) { \
-        breal x = var2real(a), y = var2real(b); \
-        var_setbool(dst, x op y); \
+        res = var2real(a) op var2real(b); \
+    } else if (var_isinstance(a) && !var_isnil(b)) { \
+        res = object_eqop(vm, #op, iseq, a, b); \
     } else if (var_type(a) == var_type(b)) { /* same types */ \
-        if (var_isnil(a)) { /* nil op nil */\
-            var_setbool(dst, 1 op 1); \
+        if (var_isnil(a)) { /* nil op nil */ \
+            res = 1 op 1; \
         } else if (var_isbool(a)) { /* bool op bool */ \
-            var_setbool(dst, var_tobool(a) op var_tobool(b)); \
+            res = var_tobool(a) op var_tobool(b); \
         } else if (var_isstr(a)) { /* string op string */ \
-            var_setbool(dst, 1 op be_eqstr(a->v.s, b->v.s)); \
-        } else if (var_isclass(a) || var_isfunction(a)) { \
-            var_setbool(dst, var_toobj(a) op var_toobj(b)); \
-        } else if (var_isinstance(a)) { \
-            object_eqop(vm, #op, ins, a, b); \
+            res = 1 op be_eqstr(a->v.s, b->v.s); \
+        } else if (var_isclass(a) || var_isfunction(a) || var_iscomptr(a)) { \
+            res = var_toobj(a) op var_toobj(b); \
         } else { \
             binop_error(vm, #op, a, b); \
+            res = bfalse; /* will not be executed */ \
         } \
     } else { /* different types */ \
-        var_setbool(dst, 1 op 0); \
-    }
+        res = 1 op 0; \
+    } \
+    return res
+
+#define relop_rule(op) \
+    bbool res; \
+    if (var_isint(a) && var_isint(b)) { \
+        res = ibinop(op, a, b); \
+    } else if (var_isnumber(a) && var_isnumber(b)) { \
+        res = var2real(a) op var2real(b); \
+    } else if (var_isstr(a) && var_isstr(b)) { \
+        bstring *s1 = var_tostr(a), *s2 = var_tostr(b); \
+        res = be_strcmp(s1, s2) op 0; \
+    } else if (var_isinstance(a)) { \
+        binstance *obj = var_toobj(a); \
+        object_binop(vm, #op, *a, *b); \
+        check_bool(vm, obj, #op); \
+        res = var_tobool(vm->top); \
+    } else { \
+        binop_error(vm, #op, a, b); \
+        res = bfalse; /* will not be executed */ \
+    } \
+    return res
 
 #define bitwise_block(op) \
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins); \
+    bvalue *dst = RA(), *a = RKB(), *b = RKC(); \
     if (var_isint(a) && var_isint(b)) { \
         var_setint(dst, ibinop(op, a, b)); \
     } else if (var_isinstance(a)) { \
-        object_binop(vm, #op, ins, a, b); \
+        ins_binop(vm, #op, ins); \
     } else { \
         binop_error(vm, #op, a, b); \
     }
@@ -96,60 +142,93 @@
     _vm->cf->status = PRIM_FUNC; \
 }
 
+static void prep_closure(bvm *vm, int pos, int argc, int mode);
+
 static void attribute_error(bvm *vm, const char *t, bvalue *b, bvalue *c)
 {
     const char *attr = var_isstr(c) ? str(var_tostr(c)) : be_vtype2str(c);
-    vm_error(vm, "'%s' value has no %s '%s'", be_vtype2str(b), t, attr);
+    vm_error(vm, "attribute_error",
+        "'%s' value has no %s '%s'", be_vtype2str(b), t, attr);
 }
 
 static void binop_error(bvm *vm, const char *op, bvalue *a, bvalue *b)
 {
-    vm_error(vm,
+    vm_error(vm, "type_error",
         "unsupported operand type(s) for %s: '%s' and '%s'",
         op, be_vtype2str(a), be_vtype2str(b));
 }
 
 static void unop_error(bvm *vm, const char *op, bvalue *a)
 {
-    vm_error(vm,
+    vm_error(vm, "type_error",
         "unsupported operand type(s) for %s: '%s'",
         op, be_vtype2str(a));
 }
 
 static void call_error(bvm *vm, bvalue *v)
 {
-    vm_error(vm, "'%s' value is not callable", be_vtype2str(v));
+    vm_error(vm, "type_error",
+        "'%s' value is not callable", be_vtype2str(v));
 }
 
+/* Check that the return value is bool or raise an exception */
+/* `obj` and `method` are only passed for error reporting */
 static void check_bool(bvm *vm, binstance *obj, const char *method)
 {
     if (!var_isbool(vm->top)) {
         const char *name = str(be_instance_name(obj));
-        be_pusherror(vm, be_pushfstring(vm,
+        vm_error(vm, "type_error",
             "`%s::%s` return value error, the expected type is 'bool'",
-            strlen(name) ? name : "<anonymous>", method));
+            strlen(name) ? name : "<anonymous>", method);
     }
 }
 
+#if BE_USE_DEBUG_HOOK
+static void do_linehook(bvm *vm)
+{
+    bcallframe *cf = vm->cf;
+    bclosure *cl = var_toobj(cf->func);
+    int pc = cast_int(vm->ip - cl->proto->code);
+    if (!pc || pc > cf->lineinfo->endpc) {
+        while (pc > cf->lineinfo->endpc)
+            cf->lineinfo++;
+        be_callhook(vm, BE_HOOK_LINE);
+    } else {
+        blineinfo *linfo = cf->lineinfo;
+        blineinfo *base = cl->proto->lineinfo;
+        while (linfo > base && pc <= linfo[-1].endpc)
+            linfo--;
+        if (cf->lineinfo != linfo) {
+            cf->lineinfo = linfo;
+            be_callhook(vm, BE_HOOK_LINE);
+        }
+    }
+}
+#endif
+
+/* Prepare the stack for the function/method call */
+/* `func` is a pointer to the function/method on the stack, it contains the closure before call and the result after the call */
+/* `nstackˋ is the stack depth used by the function (determined by compiler), we add BE_STACK_FREE_MIN as a safety margin */
 static void precall(bvm *vm, bvalue *func, int nstack, int mode)
 {
     bcallframe *cf;
-    int expan = nstack + BE_STACK_FREE_MIN;
-    if (vm->stacktop < func + expan) {
-        size_t fpos = func - vm->stack;
-        be_stack_expansion(vm, expan);
-        func = vm->stack + fpos;
+    int expan = nstack + BE_STACK_FREE_MIN; /* `expan` is the minimum required space on the stack */
+    if (vm->stacktop < func + expan) {  /* do we have too little space left on the stack? */
+        size_t fpos = func - vm->stack;  /* compute offset of `func` from base stack, in case stack is reallocated and base address changes */
+        be_stack_expansion(vm, expan);  /* expand stack (vector object), warning stack address changes */
+        func = vm->stack + fpos;  /* recompute `func` address with new stack address */
     }
-    be_stack_push(vm, &vm->callstack, NULL);
-    cf = be_stack_top(&vm->callstack);
+    be_stack_push(vm, &vm->callstack, NULL);  /* push a NULL value on callstack */
+    cf = be_stack_top(&vm->callstack);  /* get address of new callframe at top of callstack */
     cf->func = func - mode;
-    cf->top = vm->top;
-    cf->reg = vm->reg;
-    vm->reg = func + 1;
-    vm->top = vm->reg + nstack;
-    vm->cf = cf;
+    cf->top = vm->top;  /* save previous stack top */
+    cf->reg = vm->reg;  /* save previous stack base */
+    vm->reg = func + 1;  /* new stack base is right after function */
+    vm->top = vm->reg + nstack; /* new stack top is above the registers used by the function, so we don´t mess with them */
+    vm->cf = cf;  /* set new current callframe */
 }
 
+/* Prepare call of closure, setting the instruction pointer (ip) */
 static void push_closure(bvm *vm, bvalue *func, int nstack, int mode)
 {
     bclosure *cl = var_toobj(func);
@@ -157,6 +236,10 @@ static void push_closure(bvm *vm, bvalue *func, int nstack, int mode)
     vm->cf->ip = vm->ip;
     vm->cf->status = NONE_FLAG;
     vm->ip = cl->proto->code;
+#if BE_USE_DEBUG_HOOK
+    vm->cf->lineinfo = cl->proto->lineinfo;
+    be_callhook(vm, BE_HOOK_CALL);
+#endif
 }
 
 static void ret_native(bvm *vm)
@@ -171,9 +254,10 @@ static void ret_native(bvm *vm)
 static bbool obj2bool(bvm *vm, bvalue *var)
 {
     binstance *obj = var_toobj(var);
-    bstring *tobool = be_newstr(vm, "tobool");
+    bstring *tobool = str_literal(vm, "tobool");
     /* get operator method */
-    if (be_instance_member(obj, tobool, vm->top)) {
+    int type = be_instance_member(vm, obj, tobool, vm->top);
+    if (type != BE_NONE && type != BE_NIL) {
         vm->top[1] = *var; /* move self to argv[0] */
         be_dofunc(vm, vm->top, 1); /* call method 'tobool' */
         /* check the return value */
@@ -201,12 +285,12 @@ bbool be_value2bool(bvm *vm, bvalue *v)
     }
 }
 
-static void obj_method(bvm *vm, bvalue *o, bstring *attr)
+static void obj_method(bvm *vm, bvalue *o, bstring *attr, bvalue *dst)
 {
     binstance *obj = var_toobj(o);
-    int type = be_instance_member(obj, attr, vm->top);
+    int type = be_instance_member_simple(vm, obj, attr, dst);
     if (basetype(type) != BE_FUNCTION) {
-        vm_error(vm,
+        vm_error(vm, "attribute_error",
             "the '%s' object has no method '%s'",
             str(be_instance_name(obj)), str(attr));
     }
@@ -215,649 +299,979 @@ static void obj_method(bvm *vm, bvalue *o, bstring *attr)
 static int obj_attribute(bvm *vm, bvalue *o, bstring *attr, bvalue *dst)
 {
     binstance *obj = var_toobj(o);
-    int type = be_instance_member(obj, attr, dst);
-    if (basetype(type) == BE_NIL) {
-        vm_error(vm,
+    int type = be_instance_member(vm, obj, attr, dst);
+    if (type == BE_NONE) {
+        vm_error(vm, "attribute_error",
             "the '%s' object has no attribute '%s'",
             str(be_instance_name(obj)), str(attr));
     }
     return type;
 }
 
-static void object_eqop(bvm *vm,
-    const char *op, binstruction ins, bvalue *a, bvalue *b)
+static int class_attribute(bvm *vm, bvalue *o, bvalue *c, bvalue *dst)
 {
-    binstance *obj = var_toobj(a);
-    /* get operator method */
-    int type = be_instance_member(obj, be_newstr(vm, op), vm->top);
+    bstring *attr = var_tostr(c);
+    bclass *obj = var_toobj(o);
+    int type = be_class_member(vm, obj, attr, dst);
+    if (type == BE_NONE || type == BE_INDEX) {
+        vm_error(vm, "attribute_error",
+            "the '%s' class has no static attribute '%s'",
+            str(obj->name), str(attr));
+    }
+    return type;
+}
+
+static int module_attribute(bvm *vm, bvalue *o, bvalue *c, bvalue *dst)
+{
+    bstring *attr = var_tostr(c);
+    bmodule *module = var_toobj(o);
+    int type = be_module_attr(vm, module, attr, dst);
+    if (type == BE_NONE) {
+        vm_error(vm, "attribute_error",
+            "module '%s' has no member '%s'",
+            be_module_name(module), str(attr));
+    }
+    return type;
+}
+
+static bbool object_eqop(bvm *vm,
+    const char *op, bbool iseq, bvalue *a, bvalue *b)
+{
+    binstance *o = var_toobj(a);
+    bvalue self = *a, other = *b;
+    bbool isself = var_isinstance(b) && o == var_toobj(b);
+    /* first, try to call the overloaded operator of the object */
+    int type = be_instance_member(vm, o, be_newstr(vm, op), vm->top);
     if (basetype(type) == BE_FUNCTION) { /* call method */
         bvalue *top = vm->top;
-        top[1] = *a; /* move self to argv[0] */
-        top[2] = *b; /* move other to argv[1] */
+        top[1] = self;  /* move self to argv[0] */
+        top[2] = other; /* move other to argv[1] */
         be_incrtop(vm); /* prevent collection results */
         be_dofunc(vm, top, 2); /* call method 'item' */
         be_stackpop(vm, 1);
-        *RA(ins) = *vm->top; /* copy result to dst */
-        check_bool(vm, obj, op); /* check return value */
-    } else { /* default implementation */
-        int opt = IGET_OP(ins) == OP_EQ; /* operator is '==' */
-        int eqv = var_toobj(a) == var_toobj(b); /* are the same object */
-        /* if the operator is the '==', the expression is equivalent to:
-         *     RA(ins) = address(a) == address(b)
-         * else the operator is the '!=', the expression is equivalent to:
-         *     RA(ins) = address(a) != address(b)
-         **/
-        var_setbool(RA(ins), opt == eqv);
+        check_bool(vm, o, op); /* check return value */
+        return var_tobool(vm->top); /* copy result to dst */
     }
+    /* the default equal operation rule */
+    return iseq == isself; /* check object self */
 }
 
-static void object_binop(bvm *vm,
-    const char *op, binstruction ins, bvalue *a, bvalue *b)
+static void object_binop(bvm *vm, const char *op, bvalue self, bvalue other)
 {
     bvalue *top = vm->top;
-    /* get operator method */
-    obj_method(vm, a, be_newstr(vm, op));
-    top[1] = *a; /* move self to argv[0] */
-    top[2] = *b; /* move other to argv[1] */
+    /* get operator method (possible GC) */
+    obj_method(vm, &self, be_newstr(vm, op), vm->top);
+    top[1] = self; /* move self to argv[0] */
+    top[2] = other; /* move other to argv[1] */
     be_incrtop(vm); /* prevent collection results */
     be_dofunc(vm, top, 2); /* call method 'item' */
     be_stackpop(vm, 1);
-    *RA(ins) = *vm->top; /* copy result to dst */
 }
 
-static void object_unop(bvm *vm,
-    const char *op, binstruction ins, bvalue *src)
+#define ins_binop(vm, op, ins) { \
+    object_binop(vm, op, *RKB(), *RKC()); \
+    reg = vm->reg; \
+    *RA() = *vm->top; /* copy result to dst */ \
+}
+
+static void ins_unop(bvm *vm, const char *op, bvalue self)
 {
     bvalue *top = vm->top;
-    /* get operator method */
-    obj_method(vm, src, be_newstr(vm, op));
-    top[1] = *src; /* move self to argv[0] */
+    /* get operator method (possible GC) */
+    obj_method(vm, &self, be_newstr(vm, op), vm->top);
+    top[1] = self; /* move self to argv[0] */
     be_dofunc(vm, top, 1); /* call method 'item' */
-    *RA(ins) = *vm->top; /* copy result to dst */
 }
 
-static void i_ldnil(bvm *vm, binstruction ins)
+bbool be_vm_iseq(bvm *vm, bvalue *a, bvalue *b)
 {
-    var_setnil(RA(ins));
+    equal_rule(==, btrue);
 }
 
-static void i_ldbool(bvm *vm, binstruction ins)
+bbool be_vm_isneq(bvm *vm, bvalue *a, bvalue *b)
 {
-    bvalue *v = RA(ins);
-    var_setbool(v, IGET_RKB(ins));
-    if (IGET_RKC(ins)) { /* skip next instruction */
-        vm->ip++;
-    }
+    equal_rule(!=, bfalse);
 }
 
-static void i_ldint(bvm *vm, binstruction ins)
+bbool be_vm_islt(bvm *vm, bvalue *a, bvalue *b)
 {
-    bvalue *v = RA(ins);
-    var_setint(v, IGET_sBx(ins));
+    relop_rule(<);
 }
 
-static void i_getglobal(bvm *vm, binstruction ins)
+bbool be_vm_isle(bvm *vm, bvalue *a, bvalue *b)
 {
-    bvalue *v = RA(ins);
-    int idx = IGET_Bx(ins);
-    *v = *be_global_var(vm, idx);
+    relop_rule(<=);
 }
 
-static void i_setglobal(bvm *vm, binstruction ins)
+bbool be_vm_isgt(bvm *vm, bvalue *a, bvalue *b)
 {
-    bvalue *v = RA(ins);
-    int idx = IGET_Bx(ins);
-    *be_global_var(vm, idx) = *v;
+    relop_rule(>);
 }
 
-static void i_getupval(bvm *vm, binstruction ins)
+bbool be_vm_isge(bvm *vm, bvalue *a, bvalue *b)
 {
-    bvalue *v = RA(ins);
-    int idx = IGET_Bx(ins);
-    *v = *curcl(vm)->upvals[idx]->value;
+    relop_rule(>=);
 }
 
-static void i_setupval(bvm *vm, binstruction ins)
+static void make_range(bvm *vm, bvalue lower, bvalue upper)
 {
-    bvalue *v = RA(ins);
-    int idx = IGET_Bx(ins);
-    *curcl(vm)->upvals[idx]->value = *v;
-}
-
-static void i_ldconst(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins);
-    *dst = curcl(vm)->proto->ktab[IGET_Bx(ins)];
-}
-
-static void i_move(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins);
-    *dst = *RKB(ins);
-}
-
-static void i_add(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins);
-    if (var_isint(a) && var_isint(b)) {
-        var_setint(dst, ibinop(+, a, b));
-    } else if (var_isnumber(a) && var_isnumber(b)) {
-        breal x = var2real(a), y = var2real(b);
-        var_setreal(dst, x + y);
-    } else if (var_isstr(a) && var_isstr(b)) { /* strcat */
-        bstring *s = be_strcat(vm, var_tostr(a), var_tostr(b));
-        var_setstr(dst, s);
-    } else if (var_isinstance(a)) {
-        object_binop(vm, "+", ins, a, b);
-    } else {
-        binop_error(vm, "+", a, b);
-    }
-}
-
-static void i_sub(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins);
-    if (var_isint(a) && var_isint(b)) {
-        var_setint(dst, ibinop(-, a, b));
-    } else if (var_isnumber(a) && var_isnumber(b)) {
-        breal x = var2real(a), y = var2real(b);
-        var_setreal(dst, x - y);
-    } else if (var_isinstance(a)) {
-        object_binop(vm, "-", ins, a, b);
-    } else {
-        binop_error(vm, "-", a, b);
-    }
-}
-
-static void i_mul(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins);
-    if (var_isint(a) && var_isint(b)) {
-        var_setint(dst, ibinop(*, a, b));
-    } else if (var_isnumber(a) && var_isnumber(b)) {
-        breal x = var2real(a), y = var2real(b);
-        var_setreal(dst, x * y);
-    } else if (var_isinstance(a)) {
-        object_binop(vm, "*", ins, a, b);
-    } else {
-        binop_error(vm, "*", a, b);
-    }
-}
-
-static void i_div(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins);
-    if (var_isint(a) && var_isint(b)) {
-        bint x = var_toint(a), y = var_toint(b);
-        if (y == 0) {
-            vm_error(vm, "division by zero");
-        }
-        var_setint(dst, x / y);
-    } else if (var_isnumber(a) && var_isnumber(b)) {
-        breal x = var2real(a), y = var2real(b);
-        if (y == cast(breal, 0)) {
-            vm_error(vm, "division by zero");
-        }
-        var_setreal(dst, x / y);
-    } else if (var_isinstance(a)) {
-        object_binop(vm, "/", ins, a, b);
-    } else {
-        binop_error(vm, "/", a, b);
-    }
-}
-
-static void i_mod(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *a = RKB(ins), *b = RKC(ins);
-    if (var_isint(a) && var_isint(b)) {
-        var_setint(dst, ibinop(%, a, b));
-    } else if (var_isinstance(a)) {
-        object_binop(vm, "%", ins, a, b);
-    } else {
-        binop_error(vm, "%", a, b);
-    }
-}
-
-static void i_neg(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *a = RKB(ins);
-    if (var_isint(a)) {
-        var_setint(dst, -a->v.i);
-    } else if (var_isreal(a)) {
-        var_setreal(dst, -a->v.r);
-    } else if (var_isinstance(a)) {
-        object_unop(vm, "-*", ins, a);
-    } else {
-        unop_error(vm, "-", a);
-    }
-}
-
-static void i_flip(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *a = RKB(ins);
-    if (var_isint(a)) {
-        var_setint(dst, -a->v.i);
-    } else if (var_isinstance(a)) {
-        object_unop(vm, "~", ins, a);
-    } else {
-        unop_error(vm, "~", a);
-    }
-}
-
-define_function(i_lt, relop_block(<))
-define_function(i_le, relop_block(<=))
-define_function(i_gt, relop_block(>))
-define_function(i_ge, relop_block(>=))
-define_function(i_eq, equal_block(==))
-define_function(i_ne, equal_block(!=))
-define_function(i_and, bitwise_block(&))
-define_function(i_or, bitwise_block(|))
-define_function(i_xor, bitwise_block(^))
-define_function(i_shl, bitwise_block(<<))
-define_function(i_shr, bitwise_block(>>))
-
-static void i_range(bvm *vm, binstruction ins)
-{
-    bvalue *b = RKB(ins), *c = RKC(ins);
+    /* get method 'item' (possible GC) */
+    int idx = be_builtin_find(vm, str_literal(vm, "range"));
     bvalue *top = vm->top;
-    /* get method 'item' */
-    int idx = be_builtin_find(vm, be_newstr(vm, "range"));
     top[0] = *be_global_var(vm, idx);
-    top[1] = *b; /* move lower to argv[0] */
-    top[2] = *c; /* move upper to argv[1] */
+    top[1] = lower; /* move lower to argv[0] */
+    top[2] = upper; /* move upper to argv[1] */
     vm->top += 3; /* prevent collection results */
     be_dofunc(vm, top, 2); /* call method 'item' */
     vm->top -= 3;
-    *RA(ins) = *vm->top; /* copy result to R(A) */
 }
 
-static void i_jump(bvm *vm, binstruction ins)
+static void connect_str(bvm *vm, bstring *a, bvalue *b)
 {
-    vm->ip += IGET_sBx(ins);
-}
-
-static void i_jumptrue(bvm *vm, binstruction ins)
-{
-    if (be_value2bool(vm, RA(ins))) {
-        vm->ip += IGET_sBx(ins);
-    }
-}
-
-static void i_jumpfalse(bvm *vm, binstruction ins)
-{
-    if (!be_value2bool(vm, RA(ins))) {
-        vm->ip += IGET_sBx(ins);
-    }
-}
-
-static void i_return(bvm *vm, binstruction ins)
-{
-    bcallframe *cf = vm->cf;
-    bvalue *ret = vm->cf->func;
-    /* copy return value */
-    if (IGET_RA(ins)) {
-        *ret = *RKB(ins);
-    } else {
-        var_setnil(ret);
-    }
-    vm->reg = cf->reg;
-    vm->top = cf->top;
-    vm->ip = cf->ip;
-    be_stack_pop(&vm->callstack); /* pop don't delete */
-    if (cf->status & BASE_FRAME) { /* entrance function */
-        vm->cf = NULL; /* mainfunction return */
-    } else {
-        vm->cf = be_stack_top(&vm->callstack);
-    }
-}
-
-static void i_call(bvm *vm, binstruction ins)
-{
-    bvalue *var = RA(ins);
-    int mode = 0, argc = IGET_RKB(ins);
-
-    recall: /* goto: instantiation class and call constructor */
-    switch (var_type(var)) {
-    case NOT_METHOD:
-        ++var; --argc; mode = 1;
-        goto recall;
-    case BE_CLASS:
-        if (be_class_newobj(vm, var_toobj(var), var, ++argc)) {
-            ++var; /* to next register */
-            goto recall; /* call constructor */
-        }
-        ++vm->ip; /* to next instruction */
-        break;
-    case BE_CLOSURE: {
-        bvalue *v, *end;
-        bproto *proto = var2cl(var)->proto;
-        push_closure(vm, var, proto->nstack, mode);
-        v = vm->reg + argc;
-        end = vm->reg + proto->argc;
-        for (; v <= end; ++v) {
-            var_setnil(v);
-        }
-        break;
-    }
-    case BE_NTVCLOS: {
-        bntvclos *f = var_toobj(var);
-        push_native(vm, var, argc, mode);
-        f->f(vm); /* call C primitive function */
-        ret_native(vm);
-        ++vm->ip; /* to next instruction */
-        break;
-    }
-    case BE_NTVFUNC: {
-        bntvfunc f = var_tontvfunc(var);
-        push_native(vm, var, argc, mode);
-        f(vm); /* call C primitive function */
-        ret_native(vm);
-        ++vm->ip; /* to next instruction */
-        break;
-    }
-    default:
-        call_error(vm, var);
-    }
-}
-
-static void i_closure(bvm *vm, binstruction ins)
-{
-    bvalue *reg = RA(ins);
-    bproto *p = curcl(vm)->proto->ptab[IGET_Bx(ins)];
-    bclosure *cl = be_newclosure(vm, p->nupvals);
-    cl->proto = p;
-    var_setclosure(reg, cl);
-    be_initupvals(vm, cl);
-}
-
-static void i_getmember(bvm *vm, binstruction ins)
-{
-    bvalue *a = RA(ins), *b = RKB(ins), *c = RKC(ins);
-    if (var_isinstance(b) && var_isstr(c)) {
-        obj_attribute(vm, b, var_tostr(c), a);
-    } else if (var_ismodule(b) && var_isstr(c)) {
-        bstring *attr = var_tostr(c);
-        bmodule *module = var_toobj(b);
-        bvalue *v = be_module_attr(module, attr);
-        if (v) {
-            *a = *v;
-        } else {
-            vm_error(vm, "module '%s' has no attribute '%s'",
-                be_module_name(module), str(attr));
-        }
-    } else {
-        attribute_error(vm, "attribute", b, c);
-    }
-}
-
-static void i_getmethod(bvm *vm, binstruction ins)
-{
-    bvalue *a = RA(ins), *b = RKB(ins), *c = RKC(ins);
-    if (var_isinstance(b) && var_isstr(c)) {
-        bvalue self = *b;
-        bstring *attr = var_tostr(c);
-        binstance *obj = var_toobj(b);
-        int type = obj_attribute(vm, b, var_tostr(c), a);
-        if (type == MT_METHOD || type == MT_PRIMMETHOD) {
-            a[1] = self;
-        } else if (var_basetype(a) == BE_FUNCTION) {
-            a[1] = *a;
-            var_settype(a, NOT_METHOD);
-        } else {
-            vm_error(vm, "class '%s' has no method '%s'",
-                str(be_instance_name(obj)), str(attr));
-        }
-    } else if (var_ismodule(b) && var_isstr(c)) {
-        bstring *attr = var_tostr(c);
-        bmodule *module = var_toobj(b);
-        bvalue *src = be_module_attr(module, attr);
-        if (src) {
-            var_settype(a, NOT_METHOD);
-            a[1] = *src;
-        } else {
-            vm_error(vm, "module '%s' has no method '%s'",
-                be_module_name(module), str(attr));
-        }
-    } else {
-        attribute_error(vm, "method", b, c);
-    }
-}
-
-static void i_setmember(bvm *vm, binstruction ins)
-{
-    bvalue *a = RA(ins), *b = RKB(ins), *c = RKC(ins);
-    if (var_isinstance(a) && var_isstr(b)) {
-        binstance *obj = var_toobj(a);
-        bstring *attr = var_tostr(b);
-        if (!be_instance_setmember(obj, attr, c)) {
-            vm_error(vm, "class '%s' cannot assign to attribute '%s'",
-                str(be_instance_name(obj)), str(attr));
-        }
-    } else {
-        attribute_error(vm, "writable attribute", a, b);
-    }
-}
-
-static void i_getindex(bvm *vm, binstruction ins)
-{
-    bvalue *b = RKB(ins), *c = RKC(ins);
-    if (var_isinstance(b)) {
-        bvalue *top = vm->top;
-        /* get method 'item' */
-        obj_method(vm, b, be_newstr(vm, "item"));
-        top[1] = *b; /* move object to argv[0] */
-        top[2] = *c; /* move key to argv[1] */
-        vm->top += 3;   /* prevent collection results */
-        be_dofunc(vm, top, 2); /* call method 'item' */
-        vm->top -= 3;
-        *RA(ins) = *vm->top;   /* copy result to R(A) */
-    } else if (var_isstr(b)) {
-        bstring *s = be_strindex(vm, var_tostr(b), c);
-        var_setstr(RA(ins), s);
-    } else {
-        vm_error(vm,
-            "value '%s' does not support subscriptable",
-            be_vtype2str(b));
-    }
-}
-
-static void i_setindex(bvm *vm, binstruction ins)
-{
-    bvalue *a = RA(ins), *b = RKB(ins), *c = RKC(ins);
-    if (var_isinstance(a)) {
-        bvalue *top = vm->top;
-        /* get method 'setitem' */
-        obj_method(vm, a, be_newstr(vm, "setitem"));
-        top[1] = *a; /* move object to argv[0] */
-        top[2] = *b; /* move key to argv[1] */
-        top[3] = *c; /* move src to argv[2] */
-        vm->top += 4;
-        be_dofunc(vm, top, 3); /* call method 'setitem' */
-        vm->top -= 4;
-    } else {
-        vm_error(vm,
-            "value '%s' does not support index assignment",
-            be_vtype2str(a));
-    }
-}
-
-static void i_setsuper(bvm *vm, binstruction ins)
-{
-    bvalue *a = RA(ins), *b = RKB(ins);
-    if (var_isclass(a) && var_isclass(b)) {
-        bclass *obj = var_toobj(a);
-        be_class_setsuper(obj, var_toobj(b));
-    } else {
-        vm_error(vm,
-            "value '%s' does not support set super",
-            be_vtype2str(b));
-    }
-}
-
-static void i_close(bvm *vm, binstruction ins)
-{
-    be_upvals_close(vm, RA(ins));
-}
-
-static void i_import(bvm *vm, binstruction ins)
-{
-    bvalue *dst = RA(ins), *b = RKB(ins);
+    bstring *s;
     if (var_isstr(b)) {
-        bmodule *m = be_module_load(vm, var_tostr(b), dst);
-        if (m == NULL) {
-            vm_error(vm, "module '%s' not found",
-                str(var_tostr(b)));
-        }
+        s = be_strcat(vm, a, var_tostr(b));
+        var_setstr(vm->top, s);
     } else {
-        vm_error(vm,
-            "import '%s' does not support import",
-            be_vtype2str(b));
+        *vm->top++ = *b;
+        be_val2str(vm, -1);
+        b = vm->top - 1;
+        s = be_strcat(vm, a, var_tostr(b));
+        var_setstr(b, s);
+        vm->top -= 1;
     }
 }
 
-bvm* be_vm_new(void)
+BERRY_API bvm* be_vm_new(void)
 {
     bvm *vm = be_os_malloc(sizeof(bvm));
     be_assert(vm != NULL);
+    memset(vm, 0, sizeof(bvm)); /* clear all members */
     be_gc_init(vm);
     be_string_init(vm);
     be_stack_init(vm, &vm->callstack, sizeof(bcallframe));
     be_stack_init(vm, &vm->refstack, sizeof(binstance*));
-    vm->stack = be_malloc(vm, sizeof(bvalue) * BE_STACK_FREE_MIN);
-    vm->stacktop = vm->stack + BE_STACK_FREE_MIN;
-    vm->cf = NULL;
-    vm->ip = NULL;
-    vm->upvalist = NULL;
+    be_stack_init(vm, &vm->exceptstack, sizeof(struct bexecptframe));
+    be_stack_init(vm, &vm->tracestack, sizeof(bcallsnapshot));
+    vm->stack = be_malloc(vm, sizeof(bvalue) * BE_STACK_START);
+    vm->stacktop = vm->stack + BE_STACK_START;
     vm->reg = vm->stack;
     vm->top = vm->reg;
-    vm->errjmp = NULL;
-    vm->modulelist = NULL;
     be_globalvar_init(vm);
     be_gc_setpause(vm, 1);
     be_loadlibs(vm);
+    vm->compopt = 0;
+    vm->obshook = NULL;
+#if BE_USE_PERF_COUNTERS
+    vm->counter_ins = 0;
+    vm->counter_enter = 0;
+    vm->counter_call = 0;
+    vm->counter_get = 0;
+    vm->counter_set = 0;
+    vm->counter_try = 0;
+    vm->counter_exc = 0;
+    vm->counter_gc_kept = 0;
+    vm->counter_gc_freed = 0;
+#endif
     return vm;
 }
 
-void be_vm_delete(bvm *vm)
+BERRY_API void be_vm_delete(bvm *vm)
 {
     be_gc_deleteall(vm);
     be_string_deleteall(vm);
     be_stack_delete(vm, &vm->callstack);
     be_stack_delete(vm, &vm->refstack);
+    be_stack_delete(vm, &vm->exceptstack);
+    be_stack_delete(vm, &vm->tracestack);
     be_free(vm, vm->stack, (vm->stacktop - vm->stack) * sizeof(bvalue));
     be_globalvar_deinit(vm);
+#if BE_USE_DEBUG_HOOK
+    /* free native hook */
+    if (var_istype(&vm->hook, BE_COMPTR))
+        be_free(vm, var_toobj(&vm->hook), sizeof(struct bhookblock));
+#endif
+    /* free VM structure */
     be_os_free(vm);
 }
 
 static void vm_exec(bvm *vm)
 {
+    bclosure *clos;
+    bvalue *ktab, *reg;
     binstruction ins;
     vm->cf->status |= BASE_FRAME;
-    newframe:
-    for (;;) {
-        ins = *vm->ip;
-        switch (IGET_OP(ins)) {
-        case OP_LDNIL: i_ldnil(vm, ins); break;
-        case OP_LDBOOL: i_ldbool(vm, ins); break;
-        case OP_LDINT: i_ldint(vm, ins); break;
-        case OP_LDCONST: i_ldconst(vm, ins); break;
-        case OP_GETGBL: i_getglobal(vm, ins); break;
-        case OP_SETGBL: i_setglobal(vm, ins); break;
-        case OP_GETUPV: i_getupval(vm, ins); break;
-        case OP_SETUPV: i_setupval(vm, ins); break;
-        case OP_MOVE: i_move(vm, ins); break;
-        case OP_ADD: i_add(vm, ins); break;
-        case OP_SUB: i_sub(vm, ins); break;
-        case OP_MUL: i_mul(vm, ins); break;
-        case OP_DIV: i_div(vm, ins); break;
-        case OP_MOD: i_mod(vm, ins); break;
-        case OP_LT: i_lt(vm, ins); break;
-        case OP_LE: i_le(vm, ins); break;
-        case OP_EQ: i_eq(vm, ins); break;
-        case OP_NE: i_ne(vm, ins); break;
-        case OP_GT: i_gt(vm, ins); break;
-        case OP_GE: i_ge(vm, ins); break;
-        case OP_RANGE: i_range(vm, ins); break;
-        case OP_AND: i_and(vm, ins); break;
-        case OP_OR: i_or(vm, ins); break;
-        case OP_XOR: i_xor(vm, ins); break;
-        case OP_SHL: i_shl(vm, ins); break;
-        case OP_SHR: i_shr(vm, ins); break;
-        case OP_NEG: i_neg(vm, ins); break;
-        case OP_FLIP: i_flip(vm, ins); break;
-        case OP_JMP: i_jump(vm, ins); break;
-        case OP_JMPT: i_jumptrue(vm, ins); break;
-        case OP_JMPF: i_jumpfalse(vm, ins); break;
-        case OP_CALL: i_call(vm, ins); goto newframe;
-        case OP_CLOSURE: i_closure(vm, ins); break;
-        case OP_GETMBR: i_getmember(vm, ins); break;
-        case OP_GETMET: i_getmethod(vm, ins); break;
-        case OP_SETMBR: i_setmember(vm, ins); break;
-        case OP_GETIDX: i_getindex(vm, ins); break;
-        case OP_SETIDX: i_setindex(vm, ins); break;
-        case OP_SETSUPER: i_setsuper(vm, ins); break;
-        case OP_CLOSE: i_close(vm, ins); break;
-        case OP_IMPORT: i_import(vm, ins); break;
-        case OP_RET: i_return(vm, ins); goto retpoint;
-        default: retpoint:
-            if (vm->cf == NULL) {
+newframe: /* a new call frame */
+    be_assert(var_isclosure(vm->cf->func));
+    clos = var_toobj(vm->cf->func);  /* `clos` is the current function/closure */
+    ktab = clos->proto->ktab;  /* `ktab` is the current constant table */
+    reg = vm->reg;  /* `reg` is the current stack base for the callframe */
+#if BE_USE_PERF_COUNTERS
+    vm->counter_enter++;
+#endif
+    vm_exec_loop() {
+        opcase(LDNIL): {
+            var_setnil(RA());
+            dispatch();
+        }
+        opcase(LDBOOL): {
+            bvalue *v = RA();
+            var_setbool(v, IGET_RKB(ins));
+            if (IGET_RKC(ins)) { /* skip next instruction */
+                vm->ip += 1;
+            }
+            dispatch();
+        }
+        opcase(LDINT): {
+            bvalue *v = RA();
+            var_setint(v, IGET_sBx(ins));
+            dispatch();
+        }
+        opcase(LDCONST): {
+            bvalue *dst = RA();
+            *dst = ktab[IGET_Bx(ins)];
+            dispatch();
+        }
+        opcase(GETGBL): {
+            bvalue *v = RA();
+            int idx = IGET_Bx(ins);
+            *v = *be_global_var(vm, idx);
+            dispatch();
+        }
+        opcase(GETNGBL): {  /* get Global by name */
+            bvalue *v = RA();
+            bvalue *b = RKB();
+            if (var_isstr(b)) {
+                bstring *name = var_tostr(b);
+                int idx = be_global_find(vm, name);
+                if (idx > -1) {
+                    *v = *be_global_var(vm, idx);
+                } else {
+                    vm_error(vm, "attribute_error", "'%s' undeclared", str(name));
+                }
+            } else {
+                vm_error(vm, "internal_error", "global name must be a string");
+            }
+            dispatch();
+        }
+        opcase(SETNGBL): {  /* set Global by name */
+            bvalue *v = RA();
+            bvalue *b = RKB();
+            if (var_isstr(b)) {
+                bstring *name = var_tostr(b);
+                int idx = be_global_new(vm, name);
+                *be_global_var(vm, idx) = *v;
+            } else {
+                vm_error(vm, "internal_error", "global name must be a string");
+            }
+            dispatch();
+        }
+        opcase(SETGBL): {
+            bvalue *v = RA();
+            int idx = IGET_Bx(ins);
+            *be_global_var(vm, idx) = *v;
+            dispatch();
+        }
+        opcase(GETUPV): {
+            bvalue *v = RA();
+            int idx = IGET_Bx(ins);
+            be_assert(*clos->upvals != NULL);
+            *v = *clos->upvals[idx]->value;
+            dispatch();
+        }
+        opcase(SETUPV): {
+            bvalue *v = RA();
+            int idx = IGET_Bx(ins);
+            be_assert(*clos->upvals != NULL);
+            *clos->upvals[idx]->value = *v;
+            dispatch();
+        }
+        opcase(MOVE): {
+            bvalue *dst = RA();
+            *dst = *RKB();
+            dispatch();
+        }
+        opcase(ADD): {
+            bvalue *dst = RA(), *a = RKB(), *b = RKC();
+            if (var_isint(a) && var_isint(b)) {
+                var_setint(dst, ibinop(+, a, b));
+            } else if (var_isnumber(a) && var_isnumber(b)) {
+                breal x = var2real(a), y = var2real(b);
+                var_setreal(dst, x + y);
+            } else if (var_isstr(a) && var_isstr(b)) { /* strcat */
+                bstring *s = be_strcat(vm, var_tostr(a), var_tostr(b));
+                reg = vm->reg;
+                dst = RA();
+                var_setstr(dst, s);
+            } else if (var_isinstance(a)) {
+                ins_binop(vm, "+", ins);
+            } else {
+                binop_error(vm, "+", a, b);
+            }
+            dispatch();
+        }
+        opcase(SUB): {
+            bvalue *dst = RA(), *a = RKB(), *b = RKC();
+            if (var_isint(a) && var_isint(b)) {
+                var_setint(dst, ibinop(-, a, b));
+            } else if (var_isnumber(a) && var_isnumber(b)) {
+                breal x = var2real(a), y = var2real(b);
+                var_setreal(dst, x - y);
+            } else if (var_isinstance(a)) {
+                ins_binop(vm, "-", ins);
+            } else {
+                binop_error(vm, "-", a, b);
+            }
+            dispatch();
+        }
+        opcase(MUL): {
+            bvalue *dst = RA(), *a = RKB(), *b = RKC();
+            if (var_isint(a) && var_isint(b)) {
+                var_setint(dst, ibinop(*, a, b));
+            } else if (var_isnumber(a) && var_isnumber(b)) {
+                breal x = var2real(a), y = var2real(b);
+                var_setreal(dst, x * y);
+            } else if (var_isinstance(a)) {
+                ins_binop(vm, "*", ins);
+            } else {
+                binop_error(vm, "*", a, b);
+            }
+            dispatch();
+        }
+        opcase(DIV): {
+            bvalue *dst = RA(), *a = RKB(), *b = RKC();
+            if (var_isint(a) && var_isint(b)) {
+                bint x = var_toint(a), y = var_toint(b);
+                if (y == 0) {
+                    vm_error(vm, "divzero_error", "division by zero");
+                } else {
+                    var_setint(dst, x / y);
+                }
+            } else if (var_isnumber(a) && var_isnumber(b)) {
+                breal x = var2real(a), y = var2real(b);
+                if (y == cast(breal, 0)) {
+                    vm_error(vm, "divzero_error", "division by zero");
+                }
+                var_setreal(dst, x / y);
+            } else if (var_isinstance(a)) {
+                ins_binop(vm, "/", ins);
+            } else {
+                binop_error(vm, "/", a, b);
+            }
+            dispatch();
+        }
+        opcase(MOD): {
+            bvalue *dst = RA(), *a = RKB(), *b = RKC();
+            if (var_isint(a) && var_isint(b)) {
+                var_setint(dst, ibinop(%, a, b));
+            } else if (var_isnumber(a) && var_isnumber(b)) {
+                var_setreal(dst, mathfunc(fmod)(var_toreal(a), var_toreal(b)));
+            } else if (var_isinstance(a)) {
+                ins_binop(vm, "%", ins);
+            } else {
+                binop_error(vm, "%", a, b);
+            }
+            dispatch();
+        }
+        opcase(LT): {
+            bbool res = be_vm_islt(vm, RKB(), RKC());
+            bvalue *dst;
+            reg = vm->reg;
+            dst = RA();
+            var_setbool(dst, res);
+            dispatch();
+        }
+        opcase(LE): {
+            bbool res = be_vm_isle(vm, RKB(), RKC());
+            bvalue *dst;
+            reg = vm->reg;
+            dst = RA();
+            var_setbool(dst, res);
+            dispatch();
+        }
+        opcase(EQ): {
+            bbool res = be_vm_iseq(vm, RKB(), RKC());
+            bvalue *dst;
+            reg = vm->reg;
+            dst = RA();
+            var_setbool(dst, res);
+            dispatch();
+        }
+        opcase(NE): {
+            bbool res = be_vm_isneq(vm, RKB(), RKC());
+            bvalue *dst;
+            reg = vm->reg;
+            dst = RA();
+            var_setbool(dst, res);
+            dispatch();
+        }
+        opcase(GT): {
+            bbool res = be_vm_isgt(vm, RKB(), RKC());
+            bvalue *dst;
+            reg = vm->reg;
+            dst = RA();
+            var_setbool(dst, res);
+            dispatch();
+        }
+        opcase(GE): {
+            bbool res = be_vm_isge(vm, RKB(), RKC());
+            bvalue *dst;
+            reg = vm->reg;
+            dst = RA();
+            var_setbool(dst, res);
+            dispatch();
+        }
+        opcase(CONNECT): {
+            bvalue *a = RKB(), *b = RKC();
+            if (var_isint(a) && var_isint(b)) {
+                make_range(vm, *RKB(), *RKC());
+            } else if (var_isstr(a)) {
+                connect_str(vm, var_tostr(a), b);
+            } else if (var_isinstance(a)) {
+                object_binop(vm, "..", *RKB(), *RKC());
+            } else {
+                binop_error(vm, "..", RKB(), RKC());
+            }
+            reg = vm->reg;
+            *RA() = *vm->top; /* copy result to R(A) */
+            dispatch();
+        }
+        opcase(AND): {
+            bitwise_block(&);
+            dispatch();
+        }
+        opcase(OR): {
+            bitwise_block(|);
+            dispatch();
+        }
+        opcase(XOR): {
+            bitwise_block(^);
+            dispatch();
+        }
+        opcase(SHL): {
+            bitwise_block(<<);
+            dispatch();
+        }
+        opcase(SHR): {
+            bitwise_block(>>);
+            dispatch();
+        }
+        opcase(NEG): {
+            bvalue *dst = RA(), *a = RKB();
+            if (var_isint(a)) {
+                var_setint(dst, -a->v.i);
+            } else if (var_isreal(a)) {
+                var_setreal(dst, -a->v.r);
+            } else if (var_isinstance(a)) {
+                ins_unop(vm, "-*", *RKB());
+                reg = vm->reg;
+                *RA() = *vm->top; /* copy result to dst */
+            } else {
+                unop_error(vm, "-", a);
+            }
+            dispatch();
+        }
+        opcase(FLIP): {
+            bvalue *dst = RA(), *a = RKB();
+            if (var_isint(a)) {
+                var_setint(dst, ~a->v.i);
+            } else if (var_isinstance(a)) {
+                ins_unop(vm, "~", *RKB());
+                reg = vm->reg;
+                *RA() = *vm->top; /* copy result to dst */
+            } else {
+                unop_error(vm, "~", a);
+            }
+            dispatch();
+        }
+        opcase(JMP): {
+            vm->ip += IGET_sBx(ins);
+            dispatch();
+        }
+        opcase(JMPT): {
+            if (be_value2bool(vm, RA())) {
+                vm->ip += IGET_sBx(ins);
+            }
+            dispatch();
+        }
+        opcase(JMPF): {
+            if (!be_value2bool(vm, RA())) {
+                vm->ip += IGET_sBx(ins);
+            }
+            dispatch();
+        }
+        opcase(CLOSURE): {
+            bvalue *dst;
+            bproto *p = clos->proto->ptab[IGET_Bx(ins)];
+            bclosure *cl = be_newclosure(vm, p->nupvals);
+            cl->proto = p;
+            reg = vm->reg;
+            dst = RA();
+            var_setclosure(dst, cl);
+            be_initupvals(vm, cl);
+            dispatch();
+        }
+        opcase(CLASS): {
+            bclass *c = var_toobj(ktab + IGET_Bx(ins));
+            be_class_upvalue_init(vm, c);
+            dispatch();
+        }
+        opcase(GETMBR): {
+#if BE_USE_PERF_COUNTERS
+            vm->counter_get++;
+#endif
+            bvalue a_temp;  /* copy result to a temp variable because the stack may be relocated in virtual member calls */
+            bvalue *b = RKB(), *c = RKC();
+            if (var_isinstance(b) && var_isstr(c)) {
+                obj_attribute(vm, b, var_tostr(c), &a_temp);
+                reg = vm->reg;
+            } else if (var_isclass(b) && var_isstr(c)) {
+                class_attribute(vm, b, c, &a_temp);
+                reg = vm->reg;
+            } else if (var_ismodule(b) && var_isstr(c)) {
+                module_attribute(vm, b, c, &a_temp);
+                reg = vm->reg;
+            } else {
+                attribute_error(vm, "attribute", b, c);
+                a_temp = *RA();     /* avoid gcc warning for uninitialized variable a_temp, this code is never reached */
+            }
+            bvalue *a = RA();
+            *a = a_temp;    /* assign the resul to the specified register on the updated stack */
+            dispatch();
+        }
+        opcase(GETMET): {
+#if BE_USE_PERF_COUNTERS
+            vm->counter_get++;
+#endif
+            bvalue a_temp;  /* copy result to a temp variable because the stack may be relocated in virtual member calls */
+            bvalue *b = RKB(), *c = RKC();
+            if (var_isinstance(b) && var_isstr(c)) {
+                binstance *obj = var_toobj(b);
+                int type = obj_attribute(vm, b, var_tostr(c), &a_temp);
+                reg = vm->reg;
+                bvalue *a = RA();
+                *a = a_temp;
+                if (var_basetype(a) == BE_FUNCTION) {
+                    if (func_isstatic(a) || (type == BE_INDEX)) {    /* if instance variable then we consider it's non-method */
+                       /* static method, don't bother with the instance */
+                        a[1] = a_temp;
+                        var_settype(a, NOT_METHOD);
+                    } else {
+                        /* this is a real method (i.e. non-static) */
+                        /* check if the object is a superinstance, if so get the lowest possible subclass */
+                        while (obj->sub) {
+                            obj = obj->sub;
+                        }
+                        var_setinstance(&a[1], obj);  /* replace superinstance by lowest subinstance */
+                    }
+                } else {
+                    vm_error(vm, "attribute_error",
+                        "class '%s' has no method '%s'",
+                        str(be_instance_name(obj)), str(var_tostr(c)));
+                }
+            } else if (var_isclass(b) && var_isstr(c)) {
+                class_attribute(vm, b, c, &a_temp);
+                reg = vm->reg;
+                bvalue *a = RA();
+                a[1] = a_temp;
+                var_settype(a, NOT_METHOD);
+            } else if (var_ismodule(b) && var_isstr(c)) {
+                module_attribute(vm, b, c, &a_temp);
+                reg = vm->reg;
+                bvalue *a = RA();
+                a[1] = a_temp;
+                var_settype(a, NOT_METHOD);
+            } else {
+                attribute_error(vm, "method", b, c);
+            }
+            dispatch();
+        }
+        opcase(SETMBR): {
+#if BE_USE_PERF_COUNTERS
+            vm->counter_set++;
+#endif
+            bvalue *a = RA(), *b = RKB(), *c = RKC();
+            if (var_isinstance(a) && var_isstr(b)) {
+                binstance *obj = var_toobj(a);
+                bstring *attr = var_tostr(b);
+                if (!be_instance_setmember(vm, obj, attr, c)) {
+                    reg = vm->reg;
+                    vm_error(vm, "attribute_error",
+                        "class '%s' cannot assign to attribute '%s'",
+                        str(be_instance_name(obj)), str(attr));
+                }
+                reg = vm->reg;
+                dispatch();
+            }
+            if (var_isclass(a) && var_isstr(b)) {
+                /* if value is a function, we mark it as a static to distinguish from methods */
+                bclass *obj = var_toobj(a);
+                bstring *attr = var_tostr(b);
+                bvalue c_static = *c;
+                if (var_isfunction(&c_static)) {
+                    c_static.type = func_setstatic(&c_static);
+                }
+                if (!be_class_setmember(vm, obj, attr, &c_static)) {
+                    reg = vm->reg;
+                    vm_error(vm, "attribute_error",
+                        "class '%s' cannot assign to static attribute '%s'",
+                        str(be_class_name(obj)), str(attr));
+                }
+                reg = vm->reg;
+                dispatch();
+            }
+            if (var_ismodule(a) && var_isstr(b)) {
+                bmodule *obj = var_toobj(a);
+                bstring *attr = var_tostr(b);
+                if (be_module_setmember(vm, obj, attr, c)) {
+                    reg = vm->reg;
+                    dispatch();
+                } else {
+                    reg = vm->reg;
+                    // fall through exception below
+                }
+            }
+            attribute_error(vm, "writable attribute", a, b);
+            dispatch();
+        }
+        opcase(GETIDX): {
+            bvalue *b = RKB(), *c = RKC();
+            if (var_isinstance(b)) {
+                bvalue *top = vm->top;
+                /* get method 'item' */
+                obj_method(vm, b, str_literal(vm, "item"), vm->top);
+                top[1] = *b; /* move object to argv[0] */
+                top[2] = *c; /* move key to argv[1] */
+                vm->top += 3;   /* prevent collection results */
+                be_dofunc(vm, top, 2); /* call method 'item' */
+                vm->top -= 3;
+                reg = vm->reg;
+                *RA() = *vm->top;   /* copy result to R(A) */
+            } else if (var_isstr(b)) {
+                bstring *s = be_strindex(vm, var_tostr(b), c);
+                reg = vm->reg;
+                var_setstr(RA(), s);
+            } else {
+                vm_error(vm, "type_error",
+                    "value '%s' does not support subscriptable",
+                    be_vtype2str(b));
+            }
+            dispatch();
+        }
+        opcase(SETIDX): {
+            bvalue *a = RA(), *b = RKB(), *c = RKC();
+            if (var_isinstance(a)) {
+                bvalue *top = vm->top;
+                /* get method 'setitem' */
+                obj_method(vm, a, str_literal(vm, "setitem"), vm->top);
+                top[1] = *a; /* move object to argv[0] */
+                top[2] = *b; /* move key to argv[1] */
+                top[3] = *c; /* move src to argv[2] */
+                vm->top += 4;
+                be_dofunc(vm, top, 3); /* call method 'setitem' */
+                vm->top -= 4;
+                reg = vm->reg;
+            } else {
+                vm_error(vm, "type_error",
+                    "value '%s' does not support index assignment",
+                    be_vtype2str(a));
+            }
+            dispatch();
+        }
+        opcase(SETSUPER): {
+            bvalue *a = RA(), *b = RKB();
+            if (var_isclass(a) && var_isclass(b)) {
+                bclass *obj = var_toobj(a);
+                if (!gc_isconst(obj))  {
+                   be_class_setsuper(obj, var_toobj(b));
+                } else {
+                    vm_error(vm, "internal_error",
+                    "cannot change superclass of a read-only class");
+                }
+            } else {
+                vm_error(vm, "type_error",
+                    "value '%s' does not support set super",
+                    be_vtype2str(b));
+            }
+            dispatch();
+        }
+        opcase(CLOSE): {
+            be_upvals_close(vm, RA());
+            dispatch();
+        }
+        opcase(IMPORT): {
+            bvalue *b = RKB();
+            if (var_isstr(b)) {
+                bstring *name = var_tostr(b);
+                int res = be_module_load(vm, name);
+                reg = vm->reg;
+                switch (res) {
+                case BE_OK: /* find the module */
+                    be_stackpop(vm, 1);
+                    *RA() = *vm->top;
+                    break;
+                case BE_EXCEPTION: /* pop the exception value and message */
+                    be_pop(vm, 2);
+                    be_throw(vm, BE_EXCEPTION);
+                    break;
+                default:
+                    vm_error(vm, "import_error", "module '%s' not found", str(name));
+                }
+            } else {
+                vm_error(vm, "type_error",
+                    "import '%s' does not support import",
+                    be_vtype2str(b));
+            }
+            dispatch();
+        }
+        opcase(CATCH): {
+            bvalue *base = RA(), *top = vm->top;
+            int i = 0, ecnt = IGET_RKB(ins), vcnt = IGET_RKC(ins);
+            while (i < ecnt && !be_vm_iseq(vm, top, base + i)) {
+                ++i;
+            }
+            if (!ecnt || i < ecnt) { /* exception catched */
+                base = RA(), top = vm->top;
+                for (i = 0; i < vcnt; ++i) {
+                    *base++ = *top++;
+                }
+                vm->ip += 1; /* skip next instruction */
+            }
+            dispatch();
+        }
+        opcase(RAISE): {
+            if (IGET_RA(ins) < 2) {  /* A==2 means no arguments are passed to RAISE, i.e. rethrow with current exception */
+                bvalue *top = vm->top;
+                top[0] = *RKB(); /* push the exception value to top */
+                if (IGET_RA(ins)) { /* has exception argument? */
+                    top[1] = *RKC(); /* push the exception argument to top + 1 */
+                } else {
+                    var_setnil(top + 1);
+                }
+                be_save_stacktrace(vm);
+            }
+            be_throw(vm, BE_EXCEPTION); /* throw / rethrow the exception */
+            dispatch();
+        }
+        opcase(EXBLK): {
+#if BE_USE_PERF_COUNTERS
+            vm->counter_try++;
+#endif
+            if (!IGET_RA(ins)) {
+                be_except_block_setup(vm);
+                if (be_setjmp(vm->errjmp->b)) {
+                    bvalue *top = vm->top;
+                    bvalue e1 = top[0];
+                    bvalue e2 = top[1];
+                    be_except_block_resume(vm);
+                    top = vm->top;
+                    top[0] = e1;
+                    top[1] = e2;
+                    goto newframe;
+                }
+                reg = vm->reg;
+            } else {
+                be_except_block_close(vm, IGET_Bx(ins));
+            }
+            dispatch();
+        }
+        opcase(CALL): {
+#if BE_USE_PERF_COUNTERS
+            vm->counter_call++;
+#endif
+            bvalue *var = RA();  /* `var` is the register for the call followed by arguments */
+            int mode = 0, argc = IGET_RKB(ins);  /* B contains number of arguments pushed on stack */
+        recall: /* goto: instantiation class and call constructor */
+            switch (var_type(var)) {
+            case NOT_METHOD:
+                var[0] = var[1];
+                ++var, --argc, mode = 1;
+                goto recall;
+            case BE_CLASS:
+                if (be_class_newobj(vm, var_toobj(var), var - reg, ++argc, mode)) {  /* instanciate object and find constructor */
+                    reg = vm->reg + mode;  /* constructor found */
+                    mode = 0;
+                    var = RA() + 1; /* to next register */
+                    reg = vm->reg;
+                    goto recall; /* call constructor */
+                }
+                break;
+            case BE_INSTANCE: {
+                bvalue *v = var + argc++, temp;
+                /* load the '()' method to `temp' */
+                obj_method(vm, var, str_literal(vm, "()"), &temp);
+                for (; v >= var; --v) v[1] = v[0];
+                *var = temp;
+                goto recall; /* call '()' method */
+            }
+            case BE_CLOSURE: {
+                // bvalue *v, *end;
+                // bproto *proto = var2cl(var)->proto;  /* get proto for closure */
+                // push_closure(vm, var, proto->nstack, mode);  /* prepare stack for closure */
+                // reg = vm->reg;  /* `reg` has changed, now new base register */
+                // v = reg + argc;  /* end of provided arguments */
+                // end = reg + proto->argc;  /* end of expected arguments */
+                // for (; v < end; ++v) {  /* set all not provided arguments to nil */
+                //     var_setnil(v);
+                // }
+                // if (proto->varg) {  /* there are vararg at the last argument, build the list */
+                //     /* code below uses mostly low-level calls for performance */
+                //     be_stack_require(vm, argc + 2);   /* make sure we don't overflow the stack */
+                //     bvalue *top_save = vm->top;  /* save original stack, we need fresh slots to create the 'list' instance */
+                //     vm->top = v;  /* move top of stack right after last argument */
+                //     be_newobject(vm, "list");  /* this creates 2 objects on stack: list instance, BE_LIST object */
+                //     blist *list = var_toobj(vm->top-1);  /* get low-level BE_LIST structure */
+                //     v = reg + proto->argc - 1;  /* last argument */
+                //     for (; v < reg + argc; v++) {
+                //         be_list_push(vm, list, v); /* push all varargs into list */       
+                //     }
+                //     *(reg + proto->argc - 1) = *(vm->top-2);  /* change the vararg argument to now contain the list instance */
+                //     vm->top = top_save;  /* restore top of stack pointer */
+                // }
+                prep_closure(vm, var - reg, argc, mode);
+                reg = vm->reg;  /* `reg` has changed, now new base register */
+                goto newframe;  /* continue execution of the closure */
+            }
+            case BE_NTVCLOS: {
+                bntvclos *f = var_toobj(var);
+                push_native(vm, var, argc, mode);
+                f->f(vm); /* call C primitive function */
+                ret_native(vm);
+                break;
+            }
+            case BE_NTVFUNC: {
+                bntvfunc f = var_tontvfunc(var);
+                push_native(vm, var, argc, mode);
+                f(vm); /* call C primitive function */
+                ret_native(vm);
+                break;
+            }
+            case BE_MODULE: {
+                bvalue attr;
+                var_setstr(&attr, str_literal(vm, "()"));
+                module_attribute(vm, var, &attr, var);  /* exception if not found */
+                goto recall; /* call '()' method */
+                break;
+            }
+            default:
+                call_error(vm, var);
+            }
+            reg = vm->reg;
+            dispatch();
+        }
+        opcase(RET): {
+            bcallframe *cf;
+            bvalue *ret;
+#if BE_USE_DEBUG_HOOK
+            be_callhook(vm, BE_HOOK_RET);
+#endif
+            cf = vm->cf;
+            ret = vm->cf->func;
+            /* copy return value */
+            if (IGET_RA(ins)) {
+                *ret = *RKB();
+            } else {
+                var_setnil(ret);
+            }
+            vm->reg = cf->reg;
+            vm->top = cf->top;
+            vm->ip = cf->ip;
+            be_stack_pop(&vm->callstack); /* pop don't delete */
+            if (cf->status & BASE_FRAME) { /* entrance function */
                 bstack *cs = &vm->callstack;
                 if (!be_stack_isempty(cs)) {
                     vm->cf = be_stack_top(cs);
                 }
                 return;
             }
-            break;
+            vm->cf = be_stack_top(&vm->callstack);
+            goto newframe;
         }
-        ++vm->ip;
     }
 }
 
-static void do_closure(bvm *vm, bvalue *reg, int argc)
+static void prep_closure(bvm *vm, int pos, int argc, int mode)
 {
     bvalue *v, *end;
-    bproto *proto = var2cl(reg)->proto;
-    push_closure(vm, reg, proto->nstack, 0);
-    v = vm->reg + argc;
+    bproto *proto = var2cl(vm->reg + pos)->proto;
+    push_closure(vm, vm->reg + pos, proto->nstack, mode);
     end = vm->reg + proto->argc;
-    for (; v <= end; ++v) {
+    for (v = vm->reg + argc; v <= end; ++v) {
         var_setnil(v);
     }
+    if (proto->varg) {  /* there are vararg at the last argument, build the list */
+        /* code below uses mostly low-level calls for performance */
+        be_stack_require(vm, argc + 2);   /* make sure we don't overflow the stack */
+        bvalue *top_save = vm->top;  /* save original stack, we need fresh slots to create the 'list' instance */
+        vm->top = v;  /* move top of stack right after last argument */
+        be_newobject(vm, "list");  /* this creates 2 objects on stack: list instance, BE_LIST object */
+        blist *list = var_toobj(vm->top-1);  /* get low-level BE_LIST structure */
+        v = vm->reg + proto->argc - 1;  /* last argument */
+        for (; v < vm->reg + argc; v++) {
+            be_list_push(vm, list, v); /* push all varargs into list */       
+        }
+        *(vm->reg + proto->argc - 1) = *(vm->top-2);  /* change the vararg argument to now contain the list instance */
+        vm->top = top_save;  /* restore top of stack pointer */
+    }
+}
+
+static void do_closure(bvm *vm, int pos, int argc)
+{
+    // bvalue *v, *end;
+    // bproto *proto = var2cl(reg)->proto;
+    // push_closure(vm, reg, proto->nstack, 0);
+    // v = vm->reg + argc;
+    // end = vm->reg + proto->argc;
+    // for (; v <= end; ++v) {
+    //     var_setnil(v);
+    // }
+    prep_closure(vm, pos, argc, 0);
     vm_exec(vm);
 }
 
-static void do_ntvclos(bvm *vm, bvalue *reg, int argc)
+static void do_ntvclos(bvm *vm, int pos, int argc)
 {
-    bntvclos *f = var_toobj(reg);
-    push_native(vm, reg, argc, 0);
+    bntvclos *f = var_toobj(vm->reg + pos);
+    push_native(vm, vm->reg + pos, argc, 0);
     f->f(vm); /* call C primitive function */
     ret_native(vm);
 }
 
-static void do_ntvfunc(bvm *vm, bvalue *reg, int argc)
+static void do_ntvfunc(bvm *vm, int pos, int argc)
 {
-    bntvfunc f = var_tontvfunc(reg);
-    push_native(vm, reg, argc, 0);
+    bntvfunc f = var_tontvfunc(vm->reg + pos);
+    push_native(vm, vm->reg + pos, argc, 0);
     f(vm); /* call C primitive function */
     ret_native(vm);
 }
 
-static void do_class(bvm *vm, bvalue *reg, int argc)
+static void do_class(bvm *vm, int pos, int argc)
 {
-    if (be_class_newobj(vm, var_toobj(reg), reg, ++argc)) {
+    if (be_class_newobj(vm, var_toobj(vm->reg + pos), pos, ++argc, 0)) {
         be_incrtop(vm);
-        be_dofunc(vm, reg + 1, argc);
+        be_dofunc(vm, vm->reg + pos + 1, argc);
         be_stackpop(vm, 1);
     }
 }
 
 void be_dofunc(bvm *vm, bvalue *v, int argc)
 {
+    be_assert(vm->reg <= v && v < vm->stacktop);
+    be_assert(vm->stack <= vm->reg && vm->reg < vm->stacktop);
+    int pos = v - vm->reg;
     switch (var_type(v)) {
-    case BE_CLASS: do_class(vm, v, argc); break;
-    case BE_CLOSURE: do_closure(vm, v, argc); break;
-    case BE_NTVCLOS: do_ntvclos(vm, v, argc); break;
-    case BE_NTVFUNC: do_ntvfunc(vm, v, argc); break;
+    case BE_CLASS: do_class(vm, pos, argc); break;
+    case BE_CLOSURE: do_closure(vm, pos, argc); break;
+    case BE_NTVCLOS: do_ntvclos(vm, pos, argc); break;
+    case BE_NTVFUNC: do_ntvfunc(vm, pos, argc); break;
     default: call_error(vm, v);
     }
+}
+
+BERRY_API void be_set_obs_hook(bvm *vm, bobshook hook)
+{
+    (void)vm;       /* avoid comiler warning */
+    (void)hook;     /* avoid comiler warning */
+
+    vm->obshook = hook;
 }

@@ -1,26 +1,44 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #ifndef BE_OBJECT_H
 #define BE_OBJECT_H
 
 #include "berry.h"
 
 /* basic types, do not change value */
-#define BE_NONE         (-1)    /* unknow type */
-#define BE_COMPTR       (-2)    /* common pointer */
 #define BE_NIL          0
 #define BE_INT          1
 #define BE_REAL         2
 #define BE_BOOL         3
-#define BE_FUNCTION     4
-#define BE_STRING       5
-#define BE_CLASS        6
-#define BE_INSTANCE     7
-#define BE_PROTO        8
-#define BE_LIST         9
-#define BE_MAP          10
-#define BE_MODULE       11
+#define BE_NONE         4       /* unknown type */
+#define BE_COMPTR       5       /* common pointer */
+#define BE_INDEX        6       /* index for instance variable, previously BE_INT */
+#define BE_FUNCTION     7
+
+#define BE_GCOBJECT     16      /* from this type can be gced */
+
+#define BE_STRING       16
+#define BE_CLASS        17
+#define BE_INSTANCE     18
+#define BE_PROTO        19
+#define BE_LIST         20
+#define BE_MAP          21
+#define BE_MODULE       22
+#define BE_COMOBJ       23      /* common object */
+
 #define BE_NTVFUNC      ((0 << 5) | BE_FUNCTION)
 #define BE_CLOSURE      ((1 << 5) | BE_FUNCTION)
 #define BE_NTVCLOS      ((2 << 5) | BE_FUNCTION)
+#define BE_FUNC_STATIC  (1 << 7)
+
+#define func_isstatic(o)       (((o)->type & BE_FUNC_STATIC) != 0)
+#define func_setstatic(o)      ((o)->type |= BE_FUNC_STATIC)
+#define func_clearstatic(o)    ((o)->type &= ~BE_FUNC_STATIC)
 
 #define array_count(a)   (sizeof(a) / sizeof((a)[0]))
 
@@ -44,6 +62,7 @@ typedef struct bclass bclass;
 typedef struct binstance binstance;
 typedef struct blist blist;
 typedef struct bmap bmap;
+typedef struct bupval bupval;
 
 typedef uint32_t binstruction;
 
@@ -56,6 +75,7 @@ typedef struct bstring {
 typedef struct bvector {
     int capacity;   /* the number of elements that the vector can store */
     int size;       /* the size of each element (bytes) */
+    int count;      /* number of elements of the vector */
     void *data;     /* the data block pointer, if vector is empty,
                        it will point to the first element */
     void *end;      /* pointer to the last element, if the vector is empty,
@@ -69,9 +89,18 @@ union bvaldata {
     breal r;        /* real number */
     bint i;         /* integer number */
     void *p;        /* object pointer */
+    const void *c;  /* const object pointer */
     bstring *s;     /* string pointer */
     bgcobject *gc;  /* GC object */
     bntvfunc nf;    /* native C function */
+#ifdef __cplusplus
+    BE_CONSTEXPR bvaldata(bbool v) : b(v) {}
+    BE_CONSTEXPR bvaldata(breal v) : r(v) {}
+    BE_CONSTEXPR bvaldata(bint v) : i(v) {}
+    BE_CONSTEXPR bvaldata(void *v) : p(v) {}
+    BE_CONSTEXPR bvaldata(const void *v) : c(v) {}
+    BE_CONSTEXPR bvaldata(bntvfunc v) : nf(v) {}
+#endif
 };
 
 /* berry value. for simple types, the value of the data is stored,
@@ -82,17 +111,9 @@ typedef struct bvalue {
 } bvalue;
 
 typedef struct {
-    bstring *name; /* the name of variable */
-    int startpc;   /* first point where variable is active */
-    int endpc;     /* first point where variable is dead */
-} blocalval;
-
-typedef struct {
+#if BE_DEBUG_VAR_INFO
     bstring *name;
-    int index;
-} bvaldesc;
-
-typedef struct {
+#endif
     bbyte instack;
     bbyte idx;
 } bupvaldesc;
@@ -107,21 +128,23 @@ typedef struct {
 #endif
 } blineinfo;
 
-typedef struct bupval {
-    bvalue *value;
-    union {
-        bvalue value;
-        struct bupval *next;
-    } u;
-    int refcnt;
-} bupval;
+typedef struct {
+    bstring *name;
+#if BE_DEBUG_RUNTIME_INFO > 1
+    uint16_t beginpc;
+    uint16_t endpc;
+#else
+    int beginpc;
+    int endpc;
+#endif
+} bvarinfo;
 
 typedef struct bproto {
     bcommon_header;
-    bbyte nlocal; /* local variable count */
     bbyte nstack; /* number of stack size by this function */
     bbyte nupvals; /* upvalue count */
     bbyte argc; /* argument count */
+    bbyte varg; /* variable argument position + 1 */
     bgcobject *gray; /* for gc gray list */
     bupvaldesc *upvals;
     bvalue *ktab; /* constants table */
@@ -131,13 +154,18 @@ typedef struct bproto {
     int codesize; /* code size */
     int nconst; /* constants count */
     int nproto; /* proto count */
+    bstring *source; /* source file name */
 #if BE_DEBUG_RUNTIME_INFO /* debug information */
-    bstring *source;
     blineinfo *lineinfo;
     int nlineinfo;
 #endif
+#if BE_DEBUG_VAR_INFO
+    bvarinfo *varinfo;
+    int nvarinfo;
+#endif
 } bproto;
 
+/* berry closure */
 struct bclosure {
     bcommon_header;
     bbyte nupvals;
@@ -154,6 +182,13 @@ struct bntvclos {
     bntvfunc f;
 };
 
+/* common object */
+typedef struct {
+    bcommon_header;
+    void *data;
+    bntvfunc destory;
+} bcommomobj;
+
 typedef const char* (*breader)(void*, size_t*);
 
 #define cast(_T, _v)            ((_T)(_v))
@@ -161,7 +196,7 @@ typedef const char* (*breader)(void*, size_t*);
 #define cast_bool(_v)           cast(bbool, _v)
 #define basetype(_t)            ((_t) & 0x1F)
 
-#define var_type(_v)            ((_v)->type)
+#define var_type(_v)            ((_v)->type & 0x7F)
 #define var_basetype(_v)        basetype((_v)->type)
 #define var_istype(_v, _t)      (var_type(_v) == _t)
 #define var_settype(_v, _t)     ((_v)->type = _t)
@@ -182,6 +217,8 @@ typedef const char* (*breader)(void*, size_t*);
 #define var_islist(_v)          var_istype(_v, BE_LIST)
 #define var_ismap(_v)           var_istype(_v, BE_MAP)
 #define var_ismodule(_v)        var_istype(_v, BE_MODULE)
+#define var_isindex(_v)         var_istype(_v, BE_INDEX)
+#define var_iscomptr(_v)        var_istype(_v, BE_COMPTR)
 #define var_isnumber(_v)        (var_isint(_v) || var_isreal(_v))
 
 #define var_setnil(_v)          var_settype(_v, BE_NIL)
@@ -198,6 +235,7 @@ typedef const char* (*breader)(void*, size_t*);
 #define var_setlist(_v, _o)     var_setobj(_v, BE_LIST, _o)
 #define var_setmap(_v, _o)      var_setobj(_v, BE_MAP, _o)
 #define var_setmodule(_v, _o)   var_setobj(_v, BE_MODULE, _o)
+#define var_setindex(_v, _i)      { var_settype(_v, BE_INDEX); (_v)->v.i = (_i); }
 #define var_setproto(_v, _o)    var_setobj(_v, BE_PROTO, _o)
 
 #define var_tobool(_v)          ((_v)->v.b)
@@ -210,5 +248,7 @@ typedef const char* (*breader)(void*, size_t*);
 #define var_toidx(_v)           cast_int(var_toint(_v))
 
 const char* be_vtype2str(bvalue *v);
+bvalue* be_indexof(bvm *vm, int idx);
+void be_commonobj_delete(bvm *vm, bgcobject *obj);
 
 #endif

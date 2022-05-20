@@ -1,3 +1,10 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #ifndef BE_PARSER_H
 #define BE_PARSER_H
 
@@ -5,20 +12,21 @@
 #include "be_string.h"
 
 typedef enum {
-    ETVOID,
+    ETVOID,    /* unknown (new variable or error) */
     ETNIL,
     ETBOOL,
     ETREAL,
     ETINT,
     ETSTRING,
     ETPROTO,
-    ETLOCAL,
-    ETGLOBAL,
-    ETUPVAL,
-    ETMEMBER,
-    ETINDEX,
     ETCONST,
-    ETREG
+    ETLOCAL,    /* local variable, allocated until end of scope */
+    ETGLOBAL,   /* global by index number */
+    ETUPVAL,
+    ETMEMBER,   /* member accessor (by name) */
+    ETINDEX,    /* index accessor (ex array index) */
+    ETREG,      /* temporary register, can be freed if top of stack */
+    ETNGLOBAL   /* named global */
 } exptype_t;
 
 typedef struct {
@@ -43,7 +51,7 @@ typedef struct {
 typedef struct bblockinfo {
     struct bblockinfo *prev;
     bbyte nactlocals; /* number of active local variables */
-    bbyte isloop;     /* loop mark */
+    bbyte type;       /* block type mask */
     bbyte hasupval;   /* has upvalue mark */
     int breaklist;    /* break list */
     int beginpc;      /* begin pc */
@@ -63,13 +71,19 @@ typedef struct bfuncinfo {
 #if BE_DEBUG_RUNTIME_INFO /* debug information */
     bvector linevec;
 #endif
+#if BE_DEBUG_VAR_INFO
+    bvector varvec;
+#endif
     int pc; /* program count */
-    int jpc;  /* list of pending jumps to 'pc' */
     bbyte freereg; /* first free register */
-    bbyte flag; /* anonymous function */
+    bbyte flags; /* some flages */
 } bfuncinfo;
 
-bclosure* be_parser_source(bvm *vm,
-    const char *fname, breader reader, void *data);
+/* code block type definitions */
+#define BLOCK_LOOP      1
+#define BLOCK_EXCEPT    2
+
+bclosure *be_parser_source(bvm *vm,
+    const char *fname, breader reader, void *data, bbool islocal);
 
 #endif

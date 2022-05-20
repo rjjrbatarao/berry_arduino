@@ -1,8 +1,16 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_mem.h"
 #include "be_exec.h"
 #include "be_vm.h"
 #include "be_gc.h"
 #include <stdlib.h>
+#include <string.h>
 
 #define GC_ALLOC    (1 << 2) /* GC in alloc */
 
@@ -18,17 +26,17 @@
   #define realloc               BE_EXPLICIT_REALLOC
 #endif
 
-void* be_os_malloc(size_t size)
+BERRY_API void* be_os_malloc(size_t size)
 {
     return malloc(size);
 }
 
-void be_os_free(void *ptr)
+BERRY_API void be_os_free(void *ptr)
 {
     free(ptr);
 }
 
-void* be_os_realloc(void *ptr, size_t size)
+BERRY_API void* be_os_realloc(void *ptr, size_t size)
 {
     return realloc(ptr, size);
 }
@@ -46,11 +54,15 @@ static void* _realloc(void *ptr, size_t old_size, size_t new_size)
         return malloc(new_size);
     }
     be_assert(new_size == 0);
+
+#if BE_USE_DEBUG_GC
+    memset(ptr, 0xFF, old_size); /* fill the structure with invalid pointers */
+#endif
     free(ptr);
     return NULL;
 }
 
-void* be_realloc(bvm *vm, void *ptr, size_t old_size, size_t new_size)
+BERRY_API void* be_realloc(bvm *vm, void *ptr, size_t old_size, size_t new_size)
 {
     void *block = _realloc(ptr, old_size, new_size);
     if (!block && new_size) { /* allocation failure */
@@ -64,9 +76,4 @@ void* be_realloc(bvm *vm, void *ptr, size_t old_size, size_t new_size)
     }
     vm->gc.usage = vm->gc.usage + new_size - old_size; /* update allocated count */
     return block;
-}
-
-size_t be_memcount(bvm *vm)
-{
-    return vm->gc.usage;
 }

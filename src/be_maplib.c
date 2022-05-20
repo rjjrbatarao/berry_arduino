@@ -1,4 +1,15 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_object.h"
+#include "be_func.h"
+#include "be_exec.h"
+#include "be_map.h"
+#include "be_vm.h"
 
 #define map_check_data(vm, argc)                        \
     if (!be_ismap(vm, -1) || be_top(vm) - 1 < argc) {   \
@@ -15,36 +26,27 @@ static int m_init(bvm *vm)
 {
     if (be_top(vm) > 1 && be_ismap(vm, 2)) {
         be_pushvalue(vm, 2);
-        be_setmember(vm, 1, ".data");
+        be_setmember(vm, 1, ".p");
     } else {
         be_newmap(vm);
-        be_setmember(vm, 1, ".data");
+        be_setmember(vm, 1, ".p");
     }
     be_return_nil(vm);
 }
 
 static void push_key(bvm *vm)
 {
-    if (be_isstring(vm, -2)) { /* add ''' to strings */
-        be_pushfstring(vm, "'%s'", be_tostring(vm, -2));
-    } else {
-        be_tostring(vm, -2);
-        be_pushvalue(vm, -2); /* push to top */
-    }
+    be_toescape(vm, -2, 'x'); /* escape string */
+    be_pushvalue(vm, -2); /* push to top */
     be_strconcat(vm, -5);
     be_pop(vm, 1);
 }
 
 static void push_value(bvm *vm)
 {
-    if (be_isstring(vm, -1)) { /* add ''' to strings */
-        be_pushfstring(vm, "'%s'", be_tostring(vm, -1));
-    } else {
-        be_tostring(vm, -1);
-        be_pushvalue(vm, -1); /* push to top */
-    }
-    be_strconcat(vm, -5);
-    be_pop(vm, 3);
+    be_toescape(vm, -1, 'x'); /* escape string */
+    be_strconcat(vm, -4);
+    be_pop(vm, 2);
     if (be_iter_hasnext(vm, -3)) {
         be_pushstring(vm, ", ");
         be_strconcat(vm, -3);
@@ -54,7 +56,7 @@ static void push_value(bvm *vm)
 
 static int m_tostring(bvm *vm)
 {
-    be_getmember(vm, 1, ".data");
+    be_getmember(vm, 1, ".p");
     map_check_data(vm, 1);
     map_check_ref(vm);
     be_refpush(vm, 1);
@@ -76,19 +78,9 @@ static int m_tostring(bvm *vm)
     be_return(vm);
 }
 
-static int m_insert(bvm *vm)
-{
-    be_getmember(vm, 1, ".data");
-    map_check_data(vm, 3);
-    be_pushvalue(vm, 2);
-    be_pushvalue(vm, 3);
-    be_data_insert(vm, -3);
-    be_return_nil(vm);
-}
-
 static int m_remove(bvm *vm)
 {
-    be_getmember(vm, 1, ".data");
+    be_getmember(vm, 1, ".p");
     map_check_data(vm, 2);
     be_pushvalue(vm, 2);
     be_data_remove(vm, -2);
@@ -97,16 +89,18 @@ static int m_remove(bvm *vm)
 
 static int m_item(bvm *vm)
 {
-    be_getmember(vm, 1, ".data");
+    be_getmember(vm, 1, ".p");
     map_check_data(vm, 2);
     be_pushvalue(vm, 2);
-    be_getindex(vm, -2);
+    if (!be_getindex(vm, -2)) {
+        be_raise(vm, "key_error", be_tostring(vm, 2));
+    }
     be_return(vm);
 }
 
 static int m_setitem(bvm *vm)
 {
-    be_getmember(vm, 1, ".data");
+    be_getmember(vm, 1, ".p");
     map_check_data(vm, 3);
     be_pushvalue(vm, 2);
     be_pushvalue(vm, 3);
@@ -114,60 +108,107 @@ static int m_setitem(bvm *vm)
     be_return_nil(vm);
 }
 
+static int m_find(bvm *vm)
+{
+    int argc = be_top(vm);
+    be_getmember(vm, 1, ".p");
+    map_check_data(vm, 2);
+    be_pushvalue(vm, 2);
+    /* not find and has default value */
+    if (!be_getindex(vm, -2) && argc >= 3) {
+        be_pushvalue(vm, 3);
+    }
+    be_return(vm);
+}
+
+static int m_contains(bvm *vm)
+{
+    be_getmember(vm, 1, ".p");
+    map_check_data(vm, 2);
+    be_pushvalue(vm, 2);
+    be_pushbool(vm, be_getindex(vm, -2));
+    be_return(vm);
+}
+
+static int m_insert(bvm *vm)
+{
+    bbool res;
+    be_getmember(vm, 1, ".p");
+    map_check_data(vm, 3);
+    be_pushvalue(vm, 2);
+    be_pushvalue(vm, 3);
+    res = be_data_insert(vm, -3);
+    be_pushbool(vm, res);
+    be_return(vm);
+}
+
 static int m_size(bvm *vm)
 {
-    be_getmember(vm, 1, ".data");
+    be_getmember(vm, 1, ".p");
     map_check_data(vm, 1);
     be_pushint(vm, be_data_size(vm, -1));
     be_return(vm);
 }
 
-static int i_init(bvm *vm)
+static int iter_closure(bvm *vm)
 {
-    be_pushvalue(vm, 2);
-    be_setmember(vm, 1, ".obj");
-    be_pop(vm, 1);
-    be_getmember(vm, 2, ".data");
-    be_pushiter(vm, -1);
-    be_setmember(vm, 1, ".iter");
-    be_return_nil(vm);
-}
-
-static int i_hashnext(bvm *vm)
-{
-    be_getmember(vm, 1, ".obj");
-    be_getmember(vm, -1, ".data");
-    be_getmember(vm, 1, ".iter");
-    be_pushbool(vm, be_iter_hasnext(vm, -2));
+    /* for better performance, we operate the upvalues
+     * directly without using by the stack. */
+    bntvclos *func = var_toobj(vm->cf->func);
+    bvalue *uv0 = be_ntvclos_upval(func, 0)->value; /* list value */
+    bvalue *uv1 = be_ntvclos_upval(func, 1)->value; /* iter value */
+    bmapiter iter = var_toobj(uv1);
+    bmapnode *next = be_map_next(var_toobj(uv0), &iter);
+    if (next == NULL) {
+        be_stop_iteration(vm);
+        be_return_nil(vm); /* will not be executed */
+    }
+    var_setobj(uv1, BE_COMPTR, iter); /* set upvale[1] (iter value) */
+    /* push next value to top */
+    var_setval(vm->top, &next->value);
+    be_incrtop(vm);
     be_return(vm);
-}
-
-static int i_next(bvm *vm)
-{
-    be_getmember(vm, 1, ".obj");
-    be_getmember(vm, -1, ".data");
-    be_getmember(vm, 1, ".iter");
-    be_iter_next(vm, -2); /* map next key and value */
-    be_pushvalue(vm, -3); /* push .iter to top */
-    be_setmember(vm, 1, ".iter");
-    be_pop(vm, 1);
-    be_return(vm); /* return value */
 }
 
 static int m_iter(bvm *vm)
 {
-    static const bnfuncinfo members[] = {
-        { ".obj", NULL },
-        { ".iter", NULL },
-        { "init", i_init },
-        { "hasnext", i_hashnext },
-        { "next", i_next },
-        { NULL, NULL }
-    };
-    be_pushclass(vm, "iterator", members);
-    be_pushvalue(vm, 1);
-    be_call(vm, 1);
-    be_pop(vm, 1);
+    be_pushntvclosure(vm, iter_closure, 2);
+    be_getmember(vm, 1, ".p");
+    be_setupval(vm, -2, 0);
+    be_pushiter(vm, -1);
+    be_setupval(vm, -3, 1);
+    be_pop(vm, 2);
+    be_return(vm);
+}
+
+static int keys_iter_closure(bvm *vm)
+{
+    /* for better performance, we operate the upvalues
+     * directly without using by the stack. */
+    bntvclos *func = var_toobj(vm->cf->func);
+    bvalue *uv0 = be_ntvclos_upval(func, 0)->value; /* list value */
+    bvalue *uv1 = be_ntvclos_upval(func, 1)->value; /* iter value */
+    bmapiter iter = var_toobj(uv1);
+    bmapnode *next = be_map_next(var_toobj(uv0), &iter);
+    if (next == NULL) {
+        be_stop_iteration(vm);
+        be_return_nil(vm); /* will not be executed */
+    }
+    var_setobj(uv1, BE_COMPTR, iter); /* set upvale[1] (iter value) */
+    /* push next value to top */
+    var_setobj(vm->top, next->key.type, next->key.v.p);
+    be_incrtop(vm);
+    be_return(vm);
+}
+
+static int m_keys(bvm *vm)
+{
+    be_pushntvclosure(vm, keys_iter_closure, 2);
+    be_getmember(vm, 1, ".p");
+    be_setupval(vm, -2, 0);
+    be_pushiter(vm, -1);
+    be_setupval(vm, -3, 1);
+    be_pop(vm, 2);
     be_return(vm);
 }
 
@@ -175,15 +216,18 @@ static int m_iter(bvm *vm)
 void be_load_maplib(bvm *vm)
 {
     static const bnfuncinfo members[] = {
-        { ".data", NULL },
+        { ".p", NULL },
         { "init", m_init },
         { "tostring", m_tostring },
-        { "insert", m_insert },
         { "remove", m_remove },
         { "item", m_item },
         { "setitem", m_setitem },
+        { "find", m_find },
+        { "contains", m_contains },
         { "size", m_size },
+        { "insert", m_insert },
         { "iter", m_iter },
+        { "keys", m_keys },
         { NULL, NULL }
     };
     be_regclass(vm, "map", members);
@@ -191,15 +235,18 @@ void be_load_maplib(bvm *vm)
 #else
 /* @const_object_info_begin
 class be_class_map (scope: global, name: map) {
-    .data, var
+    .p, var
     init, func(m_init)
     tostring, func(m_tostring)
-    insert, func(m_insert)
     remove, func(m_remove)
     item, func(m_item)
     setitem, func(m_setitem)
+    find, func(m_find)
+    contains, func(m_contains)
     size, func(m_size)
+    insert, func(m_insert)
     iter, func(m_iter)
+    keys, func(m_keys)
 }
 @const_object_info_end */
 #include "../generate/be_fixed_be_class_map.h"

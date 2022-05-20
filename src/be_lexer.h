@@ -1,3 +1,10 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #ifndef BE_LEXER_H
 #define BE_LEXER_H
 
@@ -40,7 +47,7 @@ typedef enum {
     OptBitXor,      /* operatoe, ^  */
     OptShiftL,      /* operatoe, <<  */
     OptShiftR,      /* operatoe, >>  */
-    OptRange,       /* operator, .. */
+    OptConnect,     /* operator, .. */
     OptAnd,         /* operator, && */
     OptOr,          /* operator, || */
     /* unary operator */
@@ -58,6 +65,8 @@ typedef enum {
     OptComma,       /* operator, , */
     OptSemic,       /* operator, ; */
     OptColon,       /* operator, : */
+    OptQuestion,    /* operator, ? */
+    OptArrow,       /* operator, -> */
     /* keyword */
     KeyIf,          /* keyword if */
     KeyElif,        /* keyword elif */
@@ -76,7 +85,11 @@ typedef enum {
     KeyVar,         /* keyword var */
     KeyDo,          /* keyword do */
     KeyImport,      /* keyword import */
-    KeyAs           /* keyword as */
+    KeyAs,          /* keyword as */
+    KeyTry,         /* keyword try */
+    KeyExcept,      /* keyword except */
+    KeyRaise,       /* keyword raise */
+    KeyStatic       /* keyword static */
 } btokentype;
 
 struct blexerreader {

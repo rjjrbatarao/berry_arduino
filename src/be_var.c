@@ -1,3 +1,10 @@
+/********************************************************************
+** Copyright (c) 2018-2020 Guan Wenliang
+** This file is part of the Berry default interpreter.
+** skiars@qq.com, https://github.com/Skiars/berry
+** See Copyright Notice in the LICENSE file or at
+** https://github.com/Skiars/berry/blob/master/LICENSE
+********************************************************************/
 #include "be_var.h"
 #include "be_vm.h"
 #include "be_vector.h"
@@ -32,7 +39,7 @@ void be_globalvar_deinit(bvm *vm)
 
 static int global_find(bvm *vm, bstring *name)
 {
-    bvalue *res = be_map_findstr(global(vm).vtab, name);
+    bvalue *res = be_map_findstr(vm, global(vm).vtab, name);
     if (res) {
         return var_toidx(res) + be_builtin_count(vm);
     }
@@ -45,18 +52,25 @@ int be_global_find(bvm *vm, bstring *name)
     return res != -1 ? res : be_builtin_find(vm, name);
 }
 
+static int global_new_anonymous(bvm *vm)
+{
+    int idx = be_global_count(vm);
+    /* allocate space for new variables */
+    be_vector_resize(vm, &global(vm).vlist, idx + 1);
+    /* set the new variable to nil */
+    var_setnil((bvalue *)global(vm).vlist.end);
+    return idx;
+}
+
 int be_global_new(bvm *vm, bstring *name)
 {
     int idx = global_find(vm, name);
     if (idx == -1) {
         bvalue *desc;
-        idx = be_map_count(global(vm).vtab);
+        idx = global_new_anonymous(vm);
         desc = be_map_insertstr(vm, global(vm).vtab, name, NULL);
         var_setint(desc, idx);
-        be_vector_resize(vm, &global(vm).vlist, idx + 1);
-        /* set the new variable to nil */
-        var_setnil((bvalue *)global(vm).vlist.end);
-        return idx + be_builtin_count(vm);
+        idx += be_builtin_count(vm);
     }
     return idx;
 }
@@ -73,13 +87,13 @@ bvalue* be_global_var(bvm *vm, int index)
 
 void be_global_release_space(bvm *vm)
 {
-    be_map_release(vm, global(vm).vtab);
+    be_map_compact(vm, global(vm).vtab);
     be_vector_release(vm, &global(vm).vlist);
 }
 
 int be_builtin_find(bvm *vm, bstring *name)
 {
-    bvalue *res = be_map_findstr(builtin(vm).vtab, name);
+    bvalue *res = be_map_findstr(vm, builtin(vm).vtab, name);
     if (res) {
         return var_toidx(res);
     }
@@ -116,7 +130,7 @@ int be_builtin_new(bvm *vm, bstring *name)
 
 void be_bulitin_release_space(bvm *vm)
 {
-    be_map_release(vm, builtin(vm).vtab);
+    be_map_compact(vm, builtin(vm).vtab);
     be_vector_release(vm, &builtin(vm).vlist);
 }
 #else
