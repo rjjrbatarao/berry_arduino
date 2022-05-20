@@ -13,11 +13,15 @@ chmod u+x generate.sh
 ```
 
 # Adding custom modules
+```
 create folder for modules with src ext berry_nxtfi/src
-create your custom module be_gpio_lib.c add the #include be_mapping.h and the be_extern_native_module(gpio) and your be_extern_native_class(gpio) next
-./map_build.exe -o ../../generate -i ../../src ../../berry_nxtfi/src ../../default -c ../../inc/berry_conf.h
-
-specify this on
+create your custom module be_gpio_lib.c inside custom folder
+chmod u+x generate.sh
+./generate.sh
+copy the custom .c module to src check the path of the include if correctly specified
+create new tab in your sketch as ino ie berry_gpio
+and create the function logic inside extern "c" {
+```
 
 # todo 
 
