@@ -18,7 +18,6 @@
 #include "be_func.h"
 #include "be_class.h"
 #include "be_decoder.h"
-#include "be_debug.h"
 #include "be_exec.h"
 #include <limits.h>
 
@@ -174,7 +173,7 @@ void end_varinfo(bparser *parser, int beginpc)
     if (beginpc == -1) /* use block->beginpc by default */
         beginpc = binfo->beginpc;
     /* skip the variable of the previous blocks */
-    for (; it->beginpc < beginpc; ++it);
+    for (; (it <= end) && (it->beginpc < beginpc); ++it);
     for (; it <= end; ++it) {
         if (!it->endpc) /* write to endpc only once */
             it->endpc = finfo->pc;
@@ -319,10 +318,17 @@ static void end_func(bparser *parser)
     proto->nconst = be_vector_count(&finfo->kvec);
     proto->ptab = be_vector_release(vm, &finfo->pvec);
     proto->nproto = be_vector_count(&finfo->pvec);
+#if BE_USE_MEM_ALIGNED
+    proto->code = be_move_to_aligned(vm, proto->code, proto->codesize * sizeof(binstruction));     /* move `code` to 4-bytes aligned memory region */
+    proto->ktab = be_move_to_aligned(vm, proto->ktab, proto->nconst * sizeof(bvalue));     /* move `ktab` to 4-bytes aligned memory region */
+#endif /* BE_USE_MEM_ALIGNED */
 #if BE_DEBUG_RUNTIME_INFO
-    proto->lineinfo = be_vector_release(vm, &finfo->linevec);
+    proto->lineinfo = be_vector_release(vm, &finfo->linevec);     /* move `lineinfo` to 4-bytes aligned memory region */
     proto->nlineinfo = be_vector_count(&finfo->linevec);
-#endif
+#if BE_USE_MEM_ALIGNED
+    proto->lineinfo = be_move_to_aligned(vm, proto->lineinfo, proto->nlineinfo * sizeof(blineinfo));
+#endif /* BE_USE_MEM_ALIGNED */
+#endif /* BE_DEBUG_RUNTIME_INFO */
 #if BE_DEBUG_VAR_INFO
     proto->varinfo = be_vector_release(vm, &finfo->varvec);
     proto->nvarinfo = be_vector_count(&finfo->varvec);
@@ -557,7 +563,7 @@ static void func_vararg(bparser *parser) {
     str = next_token(parser).u.s;
     match_token(parser, TokenId); /* match and skip ID */
     new_var(parser, str, &v); /* new variable */
-    parser->finfo->proto->varg = 1;   /* set varg flag */
+    parser->finfo->proto->varg |= BE_VA_VARARG;   /* set varg flag */
 }
 
 /* Parse function or method definition variable list */
@@ -606,6 +612,7 @@ static bproto* funcbody(bparser *parser, bstring *name, int type)
     finfo.proto->name = name;
     if (type & FUNC_METHOD) { /* If method, add an implicit first argument `self` */
         new_localvar(parser, parser_newstr(parser, "self"));
+        finfo.proto->varg |= BE_VA_METHOD;
     }
     func_varlist(parser); /* parse arg list */
     stmtlist(parser); /* parse statement without final `end` */
@@ -1391,11 +1398,11 @@ static void classvar_stmt(bparser *parser, bclass *c)
     scan_next_token(parser); /* skip 'var' */
     if (match_id(parser, name) != NULL) {
         check_class_attr(parser, c, name);
-        be_member_bind(parser->vm, c, name, btrue);
+        be_class_member_bind(parser->vm, c, name, btrue);
         while (match_skip(parser, OptComma)) { /* ',' */
             if (match_id(parser, name) != NULL) {
                 check_class_attr(parser, c, name);
-                be_member_bind(parser->vm, c, name, btrue);
+                be_class_member_bind(parser->vm, c, name, btrue);
             } else {
                 parser_error(parser, "class var error");
             }
@@ -1432,7 +1439,7 @@ static void classdef_stmt(bparser *parser, bclass *c, bbool is_static)
     name = func_name(parser, &e, 1);
     check_class_attr(parser, c, name);
     proto = funcbody(parser, name, is_static ? 0 : FUNC_METHOD);
-    be_method_bind(parser->vm, c, proto->name, proto, is_static);
+    be_class_method_bind(parser->vm, c, proto->name, proto, is_static);
     be_stackpop(parser->vm, 1);
 }
 
@@ -1445,13 +1452,13 @@ static void classstatic_stmt(bparser *parser, bclass *c, bexpdesc *e)
         classdef_stmt(parser, c, btrue);
     } else if (match_id(parser, name) != NULL) {
         check_class_attr(parser, c, name);
-        be_member_bind(parser->vm, c, name, bfalse);
+        be_class_member_bind(parser->vm, c, name, bfalse);
         class_static_assignment_expr(parser, e, name);
 
         while (match_skip(parser, OptComma)) { /* ',' */
             if (match_id(parser, name) != NULL) {
                 check_class_attr(parser, c, name);
-                be_member_bind(parser->vm, c, name, bfalse);
+                be_class_member_bind(parser->vm, c, name, bfalse);
                 class_static_assignment_expr(parser, e, name);
             } else {
                 parser_error(parser, "class static error");
@@ -1687,7 +1694,7 @@ static void statement(bparser *parser)
     case OptSemic: scan_next_token(parser); break; /* empty statement */
     default: expr_stmt(parser); break;
     }
-    be_assert(parser->finfo->freereg == be_list_count(parser->finfo->local));
+    be_assert(parser->finfo->freereg >= be_list_count(parser->finfo->local));
 }
 
 static void stmtlist(bparser *parser)

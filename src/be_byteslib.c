@@ -403,6 +403,9 @@ static bbool buf_equals(buf_impl* buf1, buf_impl* buf2)
     // we know that both buf1 and buf2 are non-null
     if (buf1->len != buf2->len) { return bfalse; }
     size_t len = buf1->len;
+    if (!buf1->bufptr && !buf2->bufptr) { return btrue; }   /* if both are null then considered equal */
+    if (!buf1->bufptr || !buf2->bufptr) { return bfalse; }  /* if only one is null, then not equal */
+    /* here none of the pointer are null */
     for (uint32_t i=0; i<len; i++) {
         if (buf_get1(buf1, i) != buf_get1(buf2, i)) { return bfalse; }
     }
@@ -432,6 +435,13 @@ static void buf_add_hex(buf_impl* attr, const char *hex, size_t len)
 /********************************************************************
 ** Wrapping into lib
 ********************************************************************/
+
+/* if the bufptr is null, don't try to dereference and raise an exception instead */
+static void check_ptr(bvm *vm, buf_impl* attr) {
+    if (!attr->bufptr) {
+        be_raise(vm, "value_error", "operation not allowed on <null> pointer");
+    }
+}
 
 /* load instance attribute into a single structure, and store 'previous' values in order to later update only the changed ones */
 /* stack item 1 must contain the instance */
@@ -650,6 +660,9 @@ buf_impl bytes_check_data(bvm *vm, size_t add_size) {
     buf_impl attr = m_read_attributes(vm, 1);
     /* check if the `size` is big enough */
     if (attr.len + (int32_t)add_size > attr.size) {
+        if (attr.fixed) {
+            be_raise(vm, BYTES_RESIZE_ERROR, BYTES_RESIZE_MESSAGE);
+        }
         /* it does not fit so we need to realocate the buffer */
         bytes_resize(vm, &attr, attr.len + add_size);
     }
@@ -678,23 +691,27 @@ static int m_tostring(bvm *vm)
         max_len = be_toint(vm, 2);  /* you can specify the len as second argument, or 0 for unlimited */
     }
     buf_impl attr = m_read_attributes(vm, 1);
-    int32_t len = attr.len;
-    if (max_len > 0 && len > max_len) {
-        len = max_len;  /* limit output size */
-        truncated = 1;
-    }
-    size_t hex_len = len * 2 + 5 + 2 + 2 + 1 + truncated * 3;  /* reserve size for `bytes("")\0` - 9 chars */
+    if (attr.bufptr) {              /* pointer looks valid */
+        int32_t len = attr.len;
+        if (max_len > 0 && len > max_len) {
+            len = max_len;  /* limit output size */
+            truncated = 1;
+        }
+        size_t hex_len = len * 2 + 5 + 2 + 2 + 1 + truncated * 3;  /* reserve size for `bytes("")\0` - 9 chars */
 
-    char * hex_out = be_pushbuffer(vm, hex_len);
-    size_t l = be_strlcpy(hex_out, "bytes('", hex_len);
-    l += tohex(&hex_out[l], hex_len - l, attr.bufptr, len);
-    if (truncated) {
-        l += be_strlcpy(&hex_out[l], "...", hex_len - l);
-    }
-    l += be_strlcpy(&hex_out[l], "')", hex_len - l);
+        char * hex_out = be_pushbuffer(vm, hex_len);
+        size_t l = be_strlcpy(hex_out, "bytes('", hex_len);
+        l += tohex(&hex_out[l], hex_len - l, attr.bufptr, len);
+        if (truncated) {
+            l += be_strlcpy(&hex_out[l], "...", hex_len - l);
+        }
+        l += be_strlcpy(&hex_out[l], "')", hex_len - l);
 
-    be_pushnstring(vm, hex_out, l); /* make escape string from buffer */
-    be_remove(vm, -2); /* remove buffer */
+        be_pushnstring(vm, hex_out, l); /* make escape string from buffer */
+        be_remove(vm, -2); /* remove buffer */
+    } else {                    /* pointer is null, don't try to dereference it as it would crash */
+        be_pushstring(vm, "bytes(<null>)");
+    }
     be_return(vm);
 }
 
@@ -704,6 +721,7 @@ static int m_tostring(bvm *vm)
 static int m_asstring(bvm *vm)
 {
     buf_impl attr = bytes_check_data(vm, 0);
+    check_ptr(vm, &attr);
     be_pushnstring(vm, (const char*) attr.bufptr, attr.len);
     be_return(vm);
 }
@@ -715,6 +733,7 @@ static int m_fromstring(bvm *vm)
         const char *s = be_tostring(vm, 2);
         int32_t len = be_strlen(vm, 2);      /* calling be_strlen to support null chars in string */
         buf_impl attr = bytes_check_data(vm, 0);
+        check_ptr(vm, &attr);
         if (attr.fixed && attr.len != len) {
             be_raise(vm, BYTES_RESIZE_ERROR, BYTES_RESIZE_MESSAGE);
         }
@@ -742,6 +761,7 @@ static int m_add(bvm *vm)
 {
     int argc = be_top(vm);
     buf_impl attr = bytes_check_data(vm, 4); /* we reserve 4 bytes anyways */
+    check_ptr(vm, &attr);
     if (attr.fixed) { be_raise(vm, BYTES_RESIZE_ERROR, BYTES_RESIZE_MESSAGE); }
     if (argc >= 2 && be_isint(vm, 2)) {
         int32_t v = be_toint(vm, 2);
@@ -778,6 +798,7 @@ static int m_get(bvm *vm, bbool sign)
 {
     int argc = be_top(vm);
     buf_impl attr = bytes_check_data(vm, 0); /* we reserve 4 bytes anyways */
+    check_ptr(vm, &attr);
     if (argc >=2 && be_isint(vm, 2)) {
         int32_t idx = be_toint(vm, 2);
         int vsize = 1;
@@ -812,6 +833,30 @@ static int m_get(bvm *vm, bbool sign)
     be_return_nil(vm);
 }
 
+/*
+ * Get a float (32 bits)
+ * `getfloat(index:int [, big_endian:bool]) -> real`
+ */
+static int m_getfloat(bvm *vm)
+{
+    int argc = be_top(vm);
+    buf_impl attr = bytes_check_data(vm, 0); /* we reserve 4 bytes anyways */
+    check_ptr(vm, &attr);
+    if (argc >=2 && be_isint(vm, 2)) {
+        int32_t idx = be_toint(vm, 2);
+        bbool be = bfalse;             /* little endian? */
+        if (argc >= 3) {
+            be = be_tobool(vm, 3);
+        }
+        int32_t ret_i = be ? buf_get4_be(&attr, idx) : buf_get4_le(&attr, idx);
+        float* ret_f = (float*) &ret_i;
+        be_pop(vm, argc - 1);
+        be_pushreal(vm, *ret_f);
+        be_return(vm);
+    }
+    be_return_nil(vm);
+}
+
 /* signed int */
 static int m_geti(bvm *vm)
 {
@@ -836,6 +881,7 @@ static int m_set(bvm *vm)
 {
     int argc = be_top(vm);
     buf_impl attr = bytes_check_data(vm, 0); /* we reserve 4 bytes anyways */
+    check_ptr(vm, &attr);
     if (argc >=3 && be_isint(vm, 2) && be_isint(vm, 3)) {
         int32_t idx = be_toint(vm, 2);
         int32_t value = be_toint(vm, 3);
@@ -860,10 +906,37 @@ static int m_set(bvm *vm)
     be_return_nil(vm);
 }
 
+/*
+ * Set a 32 bits float
+ * `setfloat(index:int, value:real or int [, big_endian:bool]) -> nil`
+ * 
+ */
+static int m_setfloat(bvm *vm)
+{
+    int argc = be_top(vm);
+    buf_impl attr = bytes_check_data(vm, 0); /* we reserve 4 bytes anyways */
+    check_ptr(vm, &attr);
+    if (argc >=3 && be_isint(vm, 2) && (be_isint(vm, 3) || be_isreal(vm, 3))) {
+        int32_t idx = be_toint(vm, 2);
+        float val_f = (float) be_toreal(vm, 3);
+        int32_t* val_i = (int32_t*) &val_f;
+        bbool be = bfalse;
+        if (argc >= 4) {
+            be = be_tobool(vm, 4);
+        }
+        if (be) { buf_set4_be(&attr, idx, *val_i); } else { buf_set4_le(&attr, idx, *val_i); }
+        be_pop(vm, argc - 1);
+        m_write_attributes(vm, 1, &attr);  /* update attributes */
+        be_return_nil(vm);
+    }
+    be_return_nil(vm);
+}
+
 static int m_setitem(bvm *vm)
 {
     int argc = be_top(vm);
     buf_impl attr = bytes_check_data(vm, 0); /* we reserve 4 bytes anyways */
+    check_ptr(vm, &attr);
     if (argc >=3 && be_isint(vm, 2) && be_isint(vm, 3)) {
         int index = be_toint(vm, 2);
         int val = be_toint(vm, 3);
@@ -881,6 +954,7 @@ static int m_item(bvm *vm)
 {
     int argc = be_top(vm);
     buf_impl attr = bytes_check_data(vm, 0); /* we reserve 4 bytes anyways */
+    check_ptr(vm, &attr);
     if (argc >=2 && be_isint(vm, 2)) {  /* single byte */
         int index = be_toint(vm,2);
         if (index < 0) {
@@ -967,12 +1041,15 @@ static int m_merge(bvm *vm)
 {
     int argc = be_top(vm);
     buf_impl attr = m_read_attributes(vm, 1); /* no resize yet */
+    check_ptr(vm, &attr);
     if (argc >= 2 && be_isbytes(vm, 2)) {
         buf_impl attr2 = m_read_attributes(vm, 2);
+        check_ptr(vm, &attr2);
 
         /* allocate new object */
         bytes_new_object(vm, attr.len + attr2.len);
         buf_impl attr3 = m_read_attributes(vm, -1);
+        check_ptr(vm, &attr3);
 
         buf_add_buf(&attr3, &attr);
         buf_add_buf(&attr3, &attr2);
@@ -987,8 +1064,10 @@ static int m_merge(bvm *vm)
 static int m_copy(bvm *vm)
 {
     buf_impl attr = m_read_attributes(vm, 1);
+    check_ptr(vm, &attr);
     bytes_new_object(vm, attr.len);
     buf_impl attr2 = m_read_attributes(vm, -1);
+    check_ptr(vm, &attr2);
     buf_add_buf(&attr2, &attr);
     m_write_attributes(vm, -1, &attr2);  /* update instance */
     be_return(vm); /* return self */
@@ -999,6 +1078,7 @@ static int m_connect(bvm *vm)
 {
     int argc = be_top(vm);
     buf_impl attr = m_read_attributes(vm, 1);
+    check_ptr(vm, &attr);
     if (attr.fixed) { be_raise(vm, BYTES_RESIZE_ERROR, BYTES_RESIZE_MESSAGE); }
     if (argc >= 2 && (be_isbytes(vm, 2) || be_isint(vm, 2))) {
         if (be_isint(vm, 2)) {
@@ -1009,6 +1089,7 @@ static int m_connect(bvm *vm)
             be_return(vm); /* return self */
         } else {
             buf_impl attr2 = m_read_attributes(vm, 2);
+            check_ptr(vm, &attr2);
             bytes_resize(vm, &attr, attr.len + attr2.len); /* resize buf1 for total size */
             buf_add_buf(&attr, &attr2);
             m_write_attributes(vm, 1, &attr);  /* update instance */
@@ -1059,6 +1140,7 @@ static int m_nequal(bvm *vm)
 static int m_tob64(bvm *vm)
 {
     buf_impl attr = m_read_attributes(vm, 1);
+    check_ptr(vm, &attr);
     int32_t len = attr.len;
     int32_t b64_len = encode_base64_length(len) + 1;  /* size of base64 encoded string for this binary length, add NULL terminator */
 
@@ -1083,6 +1165,7 @@ static int m_fromb64(bvm *vm)
         int32_t bin_len = decode_base64_length((unsigned char*)s);   /* do a first pass to calculate the buffer size */
 
         buf_impl attr = m_read_attributes(vm, 1);
+        check_ptr(vm, &attr);
         if (attr.fixed && attr.len != bin_len) {
             be_raise(vm, BYTES_RESIZE_ERROR, BYTES_RESIZE_MESSAGE);
         }
@@ -1123,12 +1206,39 @@ static int m_buffer(bvm *vm)
 }
 
 /*
+ * Change the pointer to a mapped buffer.
+ * 
+ * This call does nothing if the buffer is not mapped (i.e. memory is managed externally)
+ * 
+ * It is typically used to reuse existing Berry object and avoid a complete reallocation
+ * 
+ * `_change_buffer(comptr) -> comptr`
+ */
+static int m_change_buffer(bvm *vm)
+{
+    int argc = be_top(vm);
+    if (argc >= 2 && be_iscomptr(vm, 2)) {
+        buf_impl attr = m_read_attributes(vm, 1);
+        if (!attr.mapped) {
+            be_raise(vm, "type_error", "bytes() object must be mapped");
+        }
+        attr.bufptr = be_tocomptr(vm, 2);
+        m_write_attributes(vm, 1, &attr);   /* write attributes back to instance */
+        be_pushcomptr(vm, attr.bufptr);
+        be_return(vm);
+    }
+    be_raise(vm, "type_error", "operand must be a comptr");
+    be_return_nil(vm);
+}
+
+/*
  * External API
  */
 BERRY_API void * be_pushbytes(bvm *vm, const void * bytes, size_t len)
 {
     bytes_new_object(vm, len);
     buf_impl attr = m_read_attributes(vm, -1);
+    check_ptr(vm, &attr);
     if ((int32_t)len > attr.size) { len = attr.size; } /* double check if the buffer allocated was smaller */
     if (bytes) {  /* if bytes is null, buffer is filled with zeros */
         memmove((void*)attr.bufptr, bytes, len);
@@ -1146,6 +1256,7 @@ BERRY_API const void *be_tobytes(bvm *vm, int rel_index, size_t *len)
     int index = be_absindex(vm, rel_index);
     if (be_isbytes(vm, index)) {
         buf_impl attr = m_read_attributes(vm, index);
+        check_ptr(vm, &attr);
         if (len) { *len = attr.len; }
         return (void*) attr.bufptr;
     }
@@ -1260,46 +1371,46 @@ be_local_closure(getbits,   /* name */
     1,                          /* has constants */
     ( &(const bvalue[ 5]) {     /* constants */
     /* K0   */  be_const_int(0),
-    /* K1   */  be_nested_string("value_error", 773297791, 11),
-    /* K2   */  be_nested_string("length in bits must be between 0 and 32", -1710458168, 39),
+    /* K1   */  be_nested_str(value_error),
+    /* K2   */  be_nested_str(length_X20in_X20bits_X20must_X20be_X20between_X200_X20and_X2032),
     /* K3   */  be_const_int(3),
     /* K4   */  be_const_int(1),
     }),
-    (be_nested_const_str("getbits", -1200798317, 7)),
-    (be_nested_const_str("input", -103256197, 5)),
+    &be_const_str_getbits,
+    &be_const_str_solidified,
     ( &(const binstruction[32]) {  /* code */
-      0x180C0500,  //  0000  LE  R3  R2  K0
-      0x740E0002,  //  0001  JMPT  R3  #0005
-      0x540E001F,  //  0002  LDINT  R3  32
-      0x240C0403,  //  0003  GT  R3  R2  R3
-      0x780E0000,  //  0004  JMPF  R3  #0006
-      0xB0060302,  //  0005  RAISE  1  K1  K2
-      0x580C0000,  //  0006  LDCONST  R3  K0
-      0x3C100303,  //  0007  SHR  R4  R1  K3
-      0x54160007,  //  0008  LDINT  R5  8
-      0x10040205,  //  0009  MOD  R1  R1  R5
-      0x58140000,  //  000A  LDCONST  R5  K0
-      0x24180500,  //  000B  GT  R6  R2  K0
-      0x781A0011,  //  000C  JMPF  R6  #001F
-      0x541A0007,  //  000D  LDINT  R6  8
-      0x04180C01,  //  000E  SUB  R6  R6  R1
-      0x241C0C02,  //  000F  GT  R7  R6  R2
-      0x781E0000,  //  0010  JMPF  R7  #0012
-      0x5C180400,  //  0011  MOVE  R6  R2
-      0x381E0806,  //  0012  SHL  R7  K4  R6
-      0x041C0F04,  //  0013  SUB  R7  R7  K4
-      0x381C0E01,  //  0014  SHL  R7  R7  R1
-      0x94200004,  //  0015  GETIDX  R8  R0  R4
-      0x2C201007,  //  0016  AND  R8  R8  R7
-      0x3C201001,  //  0017  SHR  R8  R8  R1
-      0x38201005,  //  0018  SHL  R8  R8  R5
-      0x300C0608,  //  0019  OR  R3  R3  R8
-      0x00140A06,  //  001A  ADD  R5  R5  R6
-      0x04080406,  //  001B  SUB  R2  R2  R6
-      0x58040000,  //  001C  LDCONST  R1  K0
-      0x00100904,  //  001D  ADD  R4  R4  K4
-      0x7001FFEB,  //  001E  JMP    #000B
-      0x80040600,  //  001F  RET  1  R3
+      0x180C0500,  //  0000  LE R3 R2 K0
+      0x740E0002,  //  0001  JMPT R3 #0005
+      0x540E001F,  //  0002  LDINT R3 32
+      0x240C0403,  //  0003  GT R3 R2 R3
+      0x780E0000,  //  0004  JMPF R3 #0006
+      0xB0060302,  //  0005  RAISE 1 K1 K2
+      0x580C0000,  //  0006  LDCONST R3 K0
+      0x3C100303,  //  0007  SHR R4 R1 K3
+      0x54160007,  //  0008  LDINT R5 8
+      0x10040205,  //  0009  MOD R1 R1 R5
+      0x58140000,  //  000A  LDCONST R5 K0
+      0x24180500,  //  000B  GT R6 R2 K0
+      0x781A0011,  //  000C  JMPF R6 #001F
+      0x541A0007,  //  000D  LDINT R6 8
+      0x04180C01,  //  000E  SUB R6 R6 R1
+      0x241C0C02,  //  000F  GT R7 R6 R2
+      0x781E0000,  //  0010  JMPF R7 #0012
+      0x5C180400,  //  0011  MOVE R6 R2
+      0x381E0806,  //  0012  SHL R7 K4 R6
+      0x041C0F04,  //  0013  SUB R7 R7 K4
+      0x381C0E01,  //  0014  SHL R7 R7 R1
+      0x94200004,  //  0015  GETIDX R8 R0 R4
+      0x2C201007,  //  0016  AND R8 R8 R7
+      0x3C201001,  //  0017  SHR R8 R8 R1
+      0x38201005,  //  0018  SHL R8 R8 R5
+      0x300C0608,  //  0019  OR R3 R3 R8
+      0x00140A06,  //  001A  ADD R5 R5 R6
+      0x04080406,  //  001B  SUB R2 R2 R6
+      0x58040000,  //  001C  LDCONST R1 K0
+      0x00100904,  //  001D  ADD R4 R4 K4
+      0x7001FFEB,  //  001E  JMP  #000B
+      0x80040600,  //  001F  RET 1 R3
     })
   )
 );
@@ -1320,51 +1431,51 @@ be_local_closure(setbits,   /* name */
     1,                          /* has constants */
     ( &(const bvalue[ 5]) {     /* constants */
     /* K0   */  be_const_int(0),
-    /* K1   */  be_nested_string("value_error", 773297791, 11),
-    /* K2   */  be_nested_string("length in bits must be between 0 and 32", -1710458168, 39),
+    /* K1   */  be_nested_str(value_error),
+    /* K2   */  be_nested_str(length_X20in_X20bits_X20must_X20be_X20between_X200_X20and_X2032),
     /* K3   */  be_const_int(3),
     /* K4   */  be_const_int(1),
     }),
-    (be_nested_const_str("setbits", -1532559129, 7)),
-    (be_nested_const_str("input", -103256197, 5)),
+    &be_const_str_setbits,
+    &be_const_str_solidified,
     ( &(const binstruction[37]) {  /* code */
-      0x14100500,  //  0000  LT  R4  R2  K0
-      0x74120002,  //  0001  JMPT  R4  #0005
-      0x5412001F,  //  0002  LDINT  R4  32
-      0x24100404,  //  0003  GT  R4  R2  R4
-      0x78120000,  //  0004  JMPF  R4  #0006
-      0xB0060302,  //  0005  RAISE  1  K1  K2
-      0x60100009,  //  0006  GETGBL  R4  G9
-      0x5C140600,  //  0007  MOVE  R5  R3
-      0x7C100200,  //  0008  CALL  R4  1
-      0x5C0C0800,  //  0009  MOVE  R3  R4
-      0x3C100303,  //  000A  SHR  R4  R1  K3
-      0x54160007,  //  000B  LDINT  R5  8
-      0x10040205,  //  000C  MOD  R1  R1  R5
-      0x24140500,  //  000D  GT  R5  R2  K0
-      0x78160014,  //  000E  JMPF  R5  #0024
-      0x54160007,  //  000F  LDINT  R5  8
-      0x04140A01,  //  0010  SUB  R5  R5  R1
-      0x24180A02,  //  0011  GT  R6  R5  R2
-      0x781A0000,  //  0012  JMPF  R6  #0014
-      0x5C140400,  //  0013  MOVE  R5  R2
-      0x381A0805,  //  0014  SHL  R6  K4  R5
-      0x04180D04,  //  0015  SUB  R6  R6  K4
-      0x541E00FE,  //  0016  LDINT  R7  255
-      0x38200C01,  //  0017  SHL  R8  R6  R1
-      0x041C0E08,  //  0018  SUB  R7  R7  R8
-      0x94200004,  //  0019  GETIDX  R8  R0  R4
-      0x2C201007,  //  001A  AND  R8  R8  R7
-      0x2C240606,  //  001B  AND  R9  R3  R6
-      0x38241201,  //  001C  SHL  R9  R9  R1
-      0x30201009,  //  001D  OR  R8  R8  R9
-      0x98000808,  //  001E  SETIDX  R0  R4  R8
-      0x3C0C0605,  //  001F  SHR  R3  R3  R5
-      0x04080405,  //  0020  SUB  R2  R2  R5
-      0x58040000,  //  0021  LDCONST  R1  K0
-      0x00100904,  //  0022  ADD  R4  R4  K4
-      0x7001FFE8,  //  0023  JMP    #000D
-      0x80040000,  //  0024  RET  1  R0
+      0x14100500,  //  0000  LT R4 R2 K0
+      0x74120002,  //  0001  JMPT R4 #0005
+      0x5412001F,  //  0002  LDINT R4 32
+      0x24100404,  //  0003  GT R4 R2 R4
+      0x78120000,  //  0004  JMPF R4 #0006
+      0xB0060302,  //  0005  RAISE 1 K1 K2
+      0x60100009,  //  0006  GETGBL R4 G9
+      0x5C140600,  //  0007  MOVE R5 R3
+      0x7C100200,  //  0008  CALL R4 1
+      0x5C0C0800,  //  0009  MOVE R3 R4
+      0x3C100303,  //  000A  SHR R4 R1 K3
+      0x54160007,  //  000B  LDINT R5 8
+      0x10040205,  //  000C  MOD R1 R1 R5
+      0x24140500,  //  000D  GT R5 R2 K0
+      0x78160014,  //  000E  JMPF R5 #0024
+      0x54160007,  //  000F  LDINT R5 8
+      0x04140A01,  //  0010  SUB R5 R5 R1
+      0x24180A02,  //  0011  GT R6 R5 R2
+      0x781A0000,  //  0012  JMPF R6 #0014
+      0x5C140400,  //  0013  MOVE R5 R2
+      0x381A0805,  //  0014  SHL R6 K4 R5
+      0x04180D04,  //  0015  SUB R6 R6 K4
+      0x541E00FE,  //  0016  LDINT R7 255
+      0x38200C01,  //  0017  SHL R8 R6 R1
+      0x041C0E08,  //  0018  SUB R7 R7 R8
+      0x94200004,  //  0019  GETIDX R8 R0 R4
+      0x2C201007,  //  001A  AND R8 R8 R7
+      0x2C240606,  //  001B  AND R9 R3 R6
+      0x38241201,  //  001C  SHL R9 R9 R1
+      0x30201009,  //  001D  OR R8 R8 R9
+      0x98000808,  //  001E  SETIDX R0 R4 R8
+      0x3C0C0605,  //  001F  SHR R3 R3 R5
+      0x04080405,  //  0020  SUB R2 R2 R5
+      0x58040000,  //  0021  LDCONST R1 K0
+      0x00100904,  //  0022  ADD R4 R4 K4
+      0x7001FFE8,  //  0023  JMP  #000D
+      0x80040000,  //  0024  RET 1 R0
     })
   )
 );
@@ -1378,6 +1489,7 @@ void be_load_byteslib(bvm *vm)
         { ".size", NULL },
         { ".len", NULL },
         { "_buffer", m_buffer },
+        { "_change_buffer", m_change_buffer },
         { "init", m_init },
         { "deinit", m_deinit },
         { "tostring", m_tostring },
@@ -1390,6 +1502,8 @@ void be_load_byteslib(bvm *vm)
         { "geti", m_geti },
         { "set", m_set },
         { "seti", m_set },      // setters for signed and unsigned are identical
+        { "getfloat", m_getfloat },
+        { "setfloat", m_setfloat },
         { "item", m_item },
         { "setitem", m_setitem },
         { "size", m_size },
@@ -1416,6 +1530,7 @@ class be_class_bytes (scope: global, name: bytes) {
     .size, var
     .len, var
     _buffer, func(m_buffer)
+    _change_buffer, func(m_change_buffer)
     init, func(m_init)
     deinit, func(m_deinit)
     tostring, func(m_tostring)
@@ -1426,6 +1541,8 @@ class be_class_bytes (scope: global, name: bytes) {
     add, func(m_add)
     get, func(m_getu)
     geti, func(m_geti)
+    getfloat, func(m_getfloat)
+    setfloat, func(m_setfloat)
     set, func(m_set)
     seti, func(m_set)
     item, func(m_item)

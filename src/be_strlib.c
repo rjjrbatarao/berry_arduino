@@ -87,7 +87,7 @@ static bstring* sim2str(bvm *vm, bvalue *v)
     case BE_REAL:
         sprintf(sbuf, "%g", var_toreal(v));
         break;
-    case BE_CLOSURE: case BE_NTVCLOS: case BE_NTVFUNC:
+    case BE_CLOSURE: case BE_NTVCLOS: case BE_NTVFUNC: case BE_CTYPE_FUNC:
         sprintf(sbuf, "<function: %p>", var_toobj(v));
         break;
     case BE_CLASS:
@@ -578,7 +578,7 @@ static int str_format(bvm *vm)
                 break;
             case 's': {
                 const char *s = be_tostring(vm, index);
-                int len = be_strlen(vm, 2);
+                int len = be_strlen(vm, index);
                 if (len > 100 && strlen(mode) == 2) {
                     be_pushvalue(vm, index);
                 } else {

@@ -174,6 +174,11 @@ typedef struct bntvmodule {
     const struct bmodule *module; /* const module object */
 } bntvmodule;
 
+/* native class object */
+struct bclass;    /* we need only the pointer to `bclass` here */
+typedef const struct bclass *bclass_ptr;
+typedef bclass_ptr bclass_array[];              /* array of bclass* pointers, NULL terminated */
+
 /* native module node definition macro */
 #ifndef __cplusplus
 #define be_native_module_nil(_name)                     \
@@ -223,10 +228,15 @@ typedef struct bntvmodule {
     static const bntvmodobj name##_attrs[] =
 
 #define be_native_module(name)  be_native_module_##name
+#define be_native_class(name)  be_class_##name
 
 /* native module declaration macro */
 #define be_extern_native_module(name)                   \
     extern const bntvmodule be_native_module(name)
+
+/* native class declaration macro */
+#define be_extern_native_class(name)                   \
+    extern const struct bclass be_native_class(name)
 
 /* native module definition macro */
 #ifndef __cplusplus
@@ -342,11 +352,11 @@ typedef struct bntvmodule {
     (bvalue*) _ktab,            /* ktab */                                        \
     (struct bproto**) _protos,  /* bproto **ptab */                               \
     (binstruction*) _code,      /* code */                                        \
-    _fname,                     /* name */                                        \
+    ((bstring*) _fname),        /* name */                                        \
     sizeof(*_code)/sizeof(binstruction),                        /* codesize */    \
     BE_IIF(_has_const)(sizeof(*_ktab)/sizeof(bvalue),0),        /* nconst */      \
     BE_IIF(_has_subproto)(sizeof(*_protos)/sizeof(bproto*),0),  /* proto */       \
-    _source,                    /* source */                                      \
+    ((bstring*) _source),        /* source */                                      \
     PROTO_RUNTIME_BLOCK                                                           \
     PROTO_VAR_INFO_BLOCK                                                          \
   }
@@ -408,6 +418,8 @@ enum beobshookevents {
   BE_OBS_VM_HEARTBEAT,    /* VM heartbeat called every million instructions */
   BE_OBS_STACK_RESIZE_START,    /* Berry stack resized */
 };
+
+typedef int (*bctypefunc)(bvm*, const void*);
 
 /* FFI functions */
 #define be_writestring(s)       be_writebuffer((s), strlen(s))
@@ -534,6 +546,7 @@ BERRY_API int be_pcall(bvm *vm, int argc);
 BERRY_API void be_exit(bvm *vm, int status);
 
 /* exception APIs */
+__attribute__((noreturn))
 BERRY_API void be_raise(bvm *vm, const char *except, const char *msg);
 BERRY_API int be_getexcept(bvm *vm, int code);
 BERRY_API void be_dumpvalue(bvm *vm, int index);
@@ -549,6 +562,8 @@ BERRY_API void be_vm_delete(bvm *vm);
 
 /* Observability hook */
 BERRY_API void be_set_obs_hook(bvm *vm, bobshook hook);
+BERRY_API void be_set_ctype_func_hanlder(bvm *vm, bctypefunc handler);
+BERRY_API bctypefunc be_get_ctype_func_hanlder(bvm *vm);
 
 /* code load APIs */
 BERRY_API int be_loadbuffer(bvm *vm,

@@ -1,1 +1,1 @@
-#include "../inc/berry_conf.h"
+#include "../default/berry_conf.h"
