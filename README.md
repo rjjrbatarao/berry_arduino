@@ -24,7 +24,7 @@ and create the function logic inside extern "c" { your custom functions here }
 ```
 
 # Todo
-* fix bug on gpio HIGH LOW and some notworking
+* fix bug on gpio PULLUP PULLDOWN amd LOW not working
 
 # Source
 https://github.com/Skiars/berry/tree/fddb25b2c58f9824862eafd37f6f0df2b0907e02
