@@ -15,15 +15,16 @@ chmod u+x generate.sh
 # Adding custom modules
 ```
 create folder for modules with src ext berry_nxtfi/src
-create your custom module be_gpio_lib.c inside custom folder
+create your custom module ie. be_gpio_lib.c inside custom folder
 chmod u+x generate.sh
 ./generate.sh
 copy the custom .c module to src check the path of the include if correctly specified
 create new tab in your sketch as ino ie berry_gpio
-and create the function logic inside extern "c" {
+and create the function logic inside extern "c" { your custom functions here }
 ```
 
-# todo 
+# Todo
+* fix bug on gpio HIGH LOW and some notworking
 
 # Source
 https://github.com/Skiars/berry/tree/fddb25b2c58f9824862eafd37f6f0df2b0907e02
