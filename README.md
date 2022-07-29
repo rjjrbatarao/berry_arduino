@@ -1,6 +1,7 @@
 # berry_arduino
 berrylang for arduino
-Current berry version 1.0.0 latest at the time writing
+Current berry version 1.0.0 latest at the time writing. 
+Thanks to s-hadinger one of Tasmota contributors for his work on berry tasmota, this library was based and mostly a copy from his works.
 
 # Gotchas
 ```
