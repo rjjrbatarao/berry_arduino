@@ -8,7 +8,7 @@ Thanks to s-hadinger one of Tasmota contributors for his work on berry tasmota, 
 Note: be_modtab.c and be_port.c should be place on the src or on the sketch root alongside .ino to be auto discovered
 Copy this to arduino libraries:
 https://github.com/rjjrbatarao/berry_mapping
-To generate mapping:
+To generate mapping: in windows use wsl with ubuntu18
 chmod u+x generate.sh
 ./generate.sh
 ```
